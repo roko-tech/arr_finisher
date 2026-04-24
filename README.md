@@ -4,6 +4,9 @@ Post-import finishing touches for **Sonarr** and **Radarr** libraries on Windows
 Runs as a custom-script hook on import and as a nightly sweep. For every series
 or movie folder it:
 
+![arr_finisher in action — library view with poster folder icons + rating suffixes, a series folder with its Links subfolder, and the Links subfolder full of shortcuts](Screenshots/example.jpg)
+
+
 - **Appends a rating suffix** to the folder name — `[IMDb 8.6]`, `[MDL 7.5]`, or `[MAL 9.3]`
 - **Picks the best rating source automatically**:
   - Korean content → [MyDramaList](https://mydramalist.com) (via the unofficial

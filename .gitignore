@@ -11,8 +11,7 @@ __pycache__/
 # Logs
 *.log
 
-# User screenshots / scratch
-Screenshots/
+# User scratch
 _scratch/
 _test_*.py
 _smoke_test.py
