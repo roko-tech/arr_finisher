@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# Logs
+*.log
+
+# User screenshots / scratch
+Screenshots/
+_scratch/
+_test_*.py
+_smoke_test.py
+_simulation_test.py
+_migrate_icon_paths.py
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
