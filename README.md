@@ -1,52 +1,93 @@
 # arr_finisher
 
-Post-import finishing touches for **Sonarr** and **Radarr** libraries on Windows.
-Runs as a custom-script hook on import and as a nightly sweep. For every series
-or movie folder it:
+Finishing touches for Sonarr/Radarr libraries on Windows. After every import
+(or during a nightly sweep), each series or movie folder gets a **poster-based
+folder icon**, a **rating suffix in the folder name**, a **Links/ subfolder**
+of handy web shortcuts, and a **hover tooltip** with the plot summary.
 
 ![arr_finisher in action — library view with poster folder icons + rating suffixes, a series folder with its Links subfolder, and the Links subfolder full of shortcuts](Screenshots/example.jpg)
 
+---
 
-- **Appends a rating suffix** to the folder name — `[IMDb 8.6]`, `[MDL 7.5]`, or `[MAL 9.3]`
-- **Picks the best rating source automatically**:
-  - Korean content → [MyDramaList](https://mydramalist.com) (via the unofficial
-    [kuryana](https://github.com/tbdsux/kuryana) API)
-  - Anime → [MyAnimeList](https://myanimelist.net) (via [jikan](https://jikan.moe))
-  - Everything else → IMDb (via [OMDb](https://www.omdbapi.com) → IMDb JSON-LD scrape as fallback)
-- **Creates a `Links/` subfolder** with Windows shortcuts to IMDb, Parents Guide, Twitter,
-  TVTime, Letterboxd, MyDramaList, MyAnimeList, and a combined subtitle search (SubDL +
-  Subsource + OpenSubtitles). Icons included.
-- **Sets the folder tooltip** (`desktop.ini` `InfoTip`) to the OMDb plot summary so the
-  description shows on hover in Explorer.
-- **Updates the Sonarr/Radarr path via API** to match the renamed folder. Rolls back the
-  disk rename if the API refuses the change, so on-disk and in-service paths never drift.
+## What it does
 
-## Quick start
+| Output | How |
+|---|---|
+| **Folder icon from the show's poster** | Drives [maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator) — the original motivation for this project |
+| **Rating suffix in folder name** | `[IMDb 8.6]`, `[MDL 7.5]`, or `[MAL 9.3]` — picks the best source automatically (see below) |
+| **`Links/` subfolder with shortcuts** | IMDb, Parents Guide, TVTime, Letterboxd, MyDramaList, MyAnimeList, Twitter, combined Subtitle (SubDL + Subsource + OpenSubtitles) |
+| **Explorer tooltip** | OMDb plot summary + rating shown on hover, via `desktop.ini` `InfoTip` |
+| **Sonarr/Radarr path sync** | Folder rename is mirrored via API with atomic rollback — disk and service never drift |
 
+### Rating source auto-detection
+
+- **Korean** content → [MyDramaList](https://mydramalist.com) (via the unofficial [kuryana](https://github.com/tbdsux/kuryana) API)
+- **Anime** → [MyAnimeList](https://myanimelist.net) (via [jikan](https://jikan.moe))
+- **Everything else** → IMDb (via [OMDb](https://www.omdbapi.com); falls back to scraping `imdb.com` JSON-LD if OMDb is unavailable)
+
+A title-similarity + year filter rejects bad fuzzy matches, so you don't
+accidentally end up with the wrong rating for "Bones (2005)" vs some other show.
+
+---
+
+## Install
+
+**Prerequisites:**
+- Windows (script uses `pywin32` for `.lnk` creation and `desktop.ini`)
+- Python 3.10+
+- [maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator) — download a release, extract (e.g. to `D:\Tools\FolderIconCreator\`), and note the path to `Creator.exe`
+
+**Install the script:**
 ```bash
 git clone https://github.com/roko-tech/arr_finisher.git
 cd arr_finisher
 python -m pip install -r requirements.txt
-cp .env.example .env      # then edit .env with your real API keys
+cp .env.example .env
+```
+
+Then edit `.env` with your API keys (see [Configure](#configure) below) and verify:
+```bash
 python arr_finisher.py --validate
 ```
 
-### Wire it into Sonarr / Radarr
+---
 
-In **Settings → Connect → Custom Script**, set the path to:
+## Configure
 
-```
-<repo>\arr_finisher.bat
-```
+All config lives in `.env` (created from `.env.example`). Real OS environment
+variables override the file.
 
-Trigger on `On Import` (and optionally `On Upgrade`). The .bat auto-locates the Python
-script via `%~dp0`, so you can place the repo anywhere.
+| Key | Required | What it's for |
+|---|:---:|---|
+| `SONARR_API_KEY` | ✓ | Sonarr → Settings → General |
+| `RADARR_API_KEY` | ✓ | Radarr → Settings → General |
+| `OMDB_API_KEY` | ✓ | Free key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx) |
+| `FOLDER_ICON_EXE` | ✓ | Absolute path to Folder-Icon-Creator's `Creator.exe` |
+| `SONARR_API_URL` | | Defaults to `http://localhost:8989` |
+| `RADARR_API_URL` | | Defaults to `http://localhost:7878` |
+| `SUBDL_API_KEY` | | Only used by the combined Subtitle shortcut to resolve direct links |
+| `OPENSUBTITLES_API_KEY` | | Same purpose |
+| `SEARCH_LANGUAGE` | | ISO code (`ar`, `en`, `ja`, …) for the Twitter hashtag filter + OpenSubtitles listing. Defaults to `ar` |
+| `KURYANA_BASE_URL` / `JIKAN_BASE_URL` | | Mirror overrides if you self-host |
+| `ARR_FINISHER_LOG_LEVEL` | | `DEBUG` for verbose permanently; default `INFO` |
 
-### Nightly sweep (recommended)
+---
 
-Periodic re-scan that catches anything missed by the hook (webhook failures, manual
-file moves, rating changes over time). Schedule via Windows Task Scheduler to run
-`arr_finisher_sweep.bat` daily at a quiet hour.
+## Run
+
+Three ways to invoke it:
+
+### 1. As a Sonarr/Radarr custom script (primary use)
+
+**Settings → Connect → Custom Script** → `<repo>\arr_finisher.bat`.
+
+Trigger on `On Import` and `On Upgrade`. The `.bat` auto-locates the `.py` via
+`%~dp0`, so you can keep the repo anywhere.
+
+### 2. Nightly sweep (recommended safety net)
+
+Catches folders the hook missed — network blips, manual moves, rating drift.
+Creates the scheduled task to run at 3 AM daily:
 
 ```powershell
 schtasks /Create /TN "arr_finisher_nightly_sweep" `
@@ -54,38 +95,19 @@ schtasks /Create /TN "arr_finisher_nightly_sweep" `
     /SC DAILY /ST 03:00 /RL HIGHEST /RU SYSTEM /F
 ```
 
-## CLI
+### 3. Manual / one-off
 
+```bash
+python arr_finisher.py --validate                                 # config + connectivity check
+python arr_finisher.py --sweep                                    # process every folder
+python arr_finisher.py --sweep --dry-run                          # preview without touching anything
+python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"  # single folder
+python arr_finisher.py --verbose                                  # include DEBUG-level logs
 ```
-python arr_finisher.py --validate         # config + connectivity check
-python arr_finisher.py --sweep            # process every folder in library roots
-python arr_finisher.py --sweep --dry-run  # preview without touching anything
-python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"   # manual single-folder
-python arr_finisher.py --verbose          # include DEBUG-level logs
-```
 
-Environment variable `ARR_FINISHER_LOG_LEVEL=DEBUG` flips verbose on permanently.
+### Sweep roots
 
-## Configuration (`.env`)
-
-Copy `.env.example` to `.env` and fill in your keys. See the example file for all
-available options. Real env vars always win over the `.env` file.
-
-| Key | Purpose | Required |
-|---|---|:---:|
-| `SONARR_API_KEY` | API key from Sonarr → Settings → General | ✓ |
-| `RADARR_API_KEY` | API key from Radarr → Settings → General | ✓ |
-| `OMDB_API_KEY` | Free key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx) | ✓ |
-| `SUBDL_API_KEY` | [subdl.com/panel/api](https://subdl.com/panel/api) | optional |
-| `OPENSUBTITLES_API_KEY` | [opensubtitles.com/consumers](https://www.opensubtitles.com/en/consumers) | optional |
-| `SEARCH_LANGUAGE` | ISO code (ar, en, ja, …) for Twitter hashtag + OpenSubtitles listings | optional |
-| `FOLDER_ICON_EXE` | Path to [FolderIconCreator.exe](https://github.com/shadoversion/FolderIconCreator) | optional |
-| `KURYANA_BASE_URL` | Kuryana mirror override (self-host, etc.) | optional |
-| `JIKAN_BASE_URL` | Jikan mirror override | optional |
-
-## Sweep roots
-
-By default the sweep scans:
+Default roots are defined at the top of `sweep_library` in `arr_finisher.py`:
 
 ```python
 DEFAULT_SWEEP_ROOTS = [
@@ -95,31 +117,29 @@ DEFAULT_SWEEP_ROOTS = [
 ]
 ```
 
-Edit the list at the top of the `sweep_library` section of `arr_finisher.py`, or
-override per-invocation:
+Override per-invocation with `--roots "D:\Shows:sonarr" "F:\Movies:radarr"`.
 
-```bash
-python arr_finisher.py --sweep --roots "D:\TV Shows:sonarr" "E:\Movies:radarr"
-```
+---
 
 ## Feature toggles
 
-All at the top of `arr_finisher.py`. Every piece of behavior is independently
-switchable — rename, icon, shortcuts, tooltip, rollback, MAL/MDL, etc.
+At the top of `arr_finisher.py` — every behavior is independently switchable
+(rename, icon, shortcuts, tooltip, MDL/MAL, subtitle combo, etc.). Defaults are
+sensible; flip what you don't want.
 
-## Running tests
+## Tests
 
 ```bash
-tests\run_tests.bat       # unit tests (fast, no network)
-tests\run_tests.bat all   # + integration tests (hits kuryana and jikan)
+tests\run_tests.bat       # fast unit tests
+tests\run_tests.bat all   # + integration tests (hits kuryana + jikan)
 ```
 
-## Requirements
+## Credits
 
-- Windows (uses `pywin32` for `.lnk` creation and `desktop.ini` attribs)
-- Python 3.10+
-- Optional: [FolderIconCreator](https://github.com/shadoversion/FolderIconCreator)
-  for folder-icon generation from cover art
+- **[maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator)** — the folder-icon generator this whole project is built around. None of this exists without it.
+- **[kuryana](https://github.com/tbdsux/kuryana)** — unofficial MyDramaList API.
+- **[jikan](https://jikan.moe)** — unofficial MyAnimeList API.
+- **[OMDb](https://www.omdbapi.com)** — ratings + plot summaries.
 
 ## License
 
