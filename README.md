@@ -84,16 +84,34 @@ Three ways to invoke it:
 Trigger on `On Import` and `On Upgrade`. The `.bat` auto-locates the `.py` via
 `%~dp0`, so you can keep the repo anywhere.
 
-### 2. Nightly sweep (recommended safety net)
+### 2. Nightly sweep (rating-refresh safety net)
 
-Catches folders the hook missed — network blips, manual moves, rating drift.
-Creates the scheduled task to run at 3 AM daily:
+The webhook handles every new import in full. The sweep is a **rating-only**
+follow-up that runs nightly to keep ratings fresh as they evolve over time.
+For each folder it:
+
+1. Looks up its IMDb ID in Sonarr/Radarr
+2. **Skips if the rating was checked in the last 7 days** (cached locally in
+   `.rating_cache.json`)
+3. Otherwise fetches a current rating from the right provider
+4. **If the rating changed** → renames the folder + updates the path in
+   Sonarr/Radarr via API (with rollback on API failure, so disk and service
+   never drift)
+
+Folder icons, shortcuts, and tooltips are **not** re-touched during sweep —
+the hook already did that when the content was imported. A typical nightly
+sweep on a fully-cached library finishes in ~10 seconds.
+
+Schedule it at 3 AM daily:
 
 ```powershell
 schtasks /Create /TN "arr_finisher_nightly_sweep" `
     /TR "\"<repo>\arr_finisher_sweep.bat\"" `
     /SC DAILY /ST 03:00 /RL HIGHEST /RU SYSTEM /F
 ```
+
+The 7-day TTL is `RATING_CACHE_TTL_DAYS` near the top of `arr_finisher.py`.
+Delete `.rating_cache.json` to force a full refresh on the next sweep.
 
 ### 3. Manual / one-off
 

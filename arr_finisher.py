@@ -66,6 +66,8 @@ ENABLE_MDL_RATING           = True   # For Korean titles: use MDL rating (falls 
 ENABLE_MAL_RATING           = True   # For anime: use MAL rating (falls back to IMDb)
 FORCE_REGENERATE_SHORTCUTS  = False  # When True, delete + recreate all shortcuts on every run
 DRY_RUN                     = False  # When True, log intended actions but don't touch disk/APIs
+RATING_ONLY                 = False  # Sweep mode: refresh rating only, skip icon/shortcuts/tooltip
+RATING_CACHE_TTL_DAYS       = 7      # In sweep mode, skip a folder if last check is newer than this
 
 # --- Shortcuts ---
 ENABLE_SHORTCUT_IMDB          = True
@@ -510,6 +512,61 @@ _mal_url_cache = {}
 def _provider_cache_key(title, year):
     clean = re.sub(r'\s*\(\d{4}\)\s*$', '', (title or '')).strip().lower()
     return (clean, str(year or ''))
+
+# ==========================
+# Rating freshness cache (sweep mode only)
+# ==========================
+RATING_CACHE_PATH = os.path.join(SCRIPT_DIR, ".rating_cache.json")
+_rating_cache = None  # lazy-loaded
+
+def _load_rating_cache():
+    global _rating_cache
+    if _rating_cache is not None:
+        return _rating_cache
+    try:
+        with open(RATING_CACHE_PATH, "r", encoding="utf-8") as f:
+            _rating_cache = json.load(f) or {}
+    except FileNotFoundError:
+        _rating_cache = {}
+    except Exception as e:
+        log_err(f"Could not load rating cache: {e}; starting empty")
+        _rating_cache = {}
+    return _rating_cache
+
+def _save_rating_cache():
+    if _rating_cache is None:
+        return
+    if DRY_RUN:
+        return
+    try:
+        with open(RATING_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_rating_cache, f, indent=2, sort_keys=True)
+    except Exception as e:
+        log_err(f"Could not save rating cache: {e}")
+
+def _rating_cache_is_fresh(imdb_id):
+    """True if the cached rating for imdb_id is younger than RATING_CACHE_TTL_DAYS."""
+    if not imdb_id:
+        return False
+    cache = _load_rating_cache()
+    entry = cache.get(imdb_id)
+    if not entry:
+        return False
+    try:
+        age_days = (time.time() - float(entry.get("checked_at", 0))) / 86400.0
+        return age_days < RATING_CACHE_TTL_DAYS
+    except Exception:
+        return False
+
+def _rating_cache_set(imdb_id, rating, source):
+    if not imdb_id:
+        return
+    cache = _load_rating_cache()
+    cache[imdb_id] = {
+        "checked_at": time.time(),
+        "rating": rating,
+        "source": source,
+    }
 
 def get_mdl_rating(title: str, year=None):
     """
@@ -1201,6 +1258,11 @@ def process_sonarr(path):
     tvdb  = os.environ.get("Sonarr_Series_TvdbId")
     title = os.environ.get("Sonarr_Series_Title", "")
 
+    # Sweep mode: skip entirely if rating was checked recently
+    if RATING_ONLY and imdb and _rating_cache_is_fresh(imdb):
+        log_debug(f"Cache fresh, skipping {title or path}")
+        return
+
     log(f"Sonarr post-import: {title or path}")
 
     series_id = os.environ.get("Sonarr_Series_Id")
@@ -1242,6 +1304,14 @@ def process_sonarr(path):
                         new_path = path  # use old path for subsequent steps
             path = new_path
 
+        # Always remember when we last checked, so the next sweep can skip us
+        if rating != "N/A":
+            _rating_cache_set(imdb, rating, source)
+
+        # Sweep mode stops here — webhook continues with icon/shortcuts/tooltip
+        if RATING_ONLY:
+            return
+
         if not os.path.isdir(path):
             log_err(f"Skipping post-rename steps: folder does not exist on disk ({path})")
             return
@@ -1258,6 +1328,10 @@ def process_radarr(path):
     imdb  = os.environ.get("Radarr_Movie_ImdbId")
     tmdb  = os.environ.get("Radarr_Movie_TmdbId")
     title = os.environ.get("Radarr_Movie_Title", "")
+
+    if RATING_ONLY and imdb and _rating_cache_is_fresh(imdb):
+        log_debug(f"Cache fresh, skipping {title or path}")
+        return
 
     log(f"Radarr post-import: {title or path}")
 
@@ -1295,6 +1369,12 @@ def process_radarr(path):
                     if rollback_rename(new_path, path):
                         new_path = path
             path = new_path
+
+        if rating != "N/A":
+            _rating_cache_set(imdb, rating, source)
+
+        if RATING_ONLY:
+            return
 
         if not os.path.isdir(path):
             log_err(f"Skipping post-rename steps: folder does not exist on disk ({path})")
@@ -1443,12 +1523,18 @@ class _EventCounter(logging.Handler):
                 return
 
 def sweep_library(roots=None):
-    """Walk library roots and (re)process every series/movie folder."""
+    """Walk library roots and refresh ratings only (rename + API path-sync if changed).
+    Skips folders whose rating was checked in the last RATING_CACHE_TTL_DAYS days.
+    Icons, shortcuts, and tooltips are NOT touched — those are webhook-time work."""
     if roots is None:
         roots = DEFAULT_SWEEP_ROOTS
     else:
         # Accept a list of "path:service" strings from CLI
         roots = [(p.strip(), s.strip()) for p, s in (x.split(":") for x in roots)]
+
+    global RATING_ONLY
+    prev_rating_only = RATING_ONLY
+    RATING_ONLY = True
 
     # Attach a counter to tally events during the sweep
     counter = _EventCounter()
@@ -1462,7 +1548,7 @@ def sweep_library(roots=None):
             if not os.path.isdir(root):
                 log(f"Sweep: root not found, skipping: {root}")
                 continue
-            log(f"Sweep: scanning {root} ({service})")
+            log(f"Sweep: scanning {root} ({service}) — rating-only mode, {RATING_CACHE_TTL_DAYS}d TTL")
             for entry in sorted(os.listdir(root)):
                 sub = os.path.join(root, entry)
                 if not os.path.isdir(sub) or entry.startswith("."):
@@ -1478,13 +1564,14 @@ def sweep_library(roots=None):
                     log_err(f"Sweep: error processing {sub}: {e}")
     finally:
         root_logger.removeHandler(counter)
+        RATING_ONLY = prev_rating_only
+        _save_rating_cache()
 
     elapsed = time.time() - start_ts
     c = counter.counts
     log(
         f"Sweep complete: {processed} processed, {unknown} unknown, {skipped} errored "
-        f"in {elapsed:.1f}s — {c['renamed']} renamed, {c['api_updated']} API-sync, "
-        f"{c['shortcut_new']} shortcut(s) created, {c['tooltip']} tooltip(s), "
+        f"in {elapsed:.1f}s — {c['renamed']} rating change(s), {c['api_updated']} API-sync, "
         f"{c['mal_rejected']+c['mdl_rejected']} rejected, {c['rollbacks']} rollback(s)"
     )
     return 0

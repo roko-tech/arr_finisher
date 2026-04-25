@@ -8,8 +8,9 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 
-# Logs
+# Logs + caches
 *.log
+.rating_cache.json
 
 # User scratch
 _scratch/
