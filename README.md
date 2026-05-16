@@ -39,7 +39,7 @@ Then in Sonarr/Radarr: **Settings → Connect → Custom Script**, point at
 
 - **Korean** content → [MyDramaList](https://mydramalist.com) (via the unofficial [kuryana](https://github.com/tbdsux/kuryana) API)
 - **Anime** → [MyAnimeList](https://myanimelist.net) (via [jikan](https://jikan.moe))
-- **Everything else** → IMDb (via [OMDb](https://www.omdbapi.com); falls back to scraping `imdb.com` JSON-LD if OMDb is unavailable)
+- **Everything else** → IMDb. Primary: IMDb's public GraphQL endpoint (live ratings, no API key). Fallback: [OMDb](https://www.omdbapi.com) — used when GraphQL is unreachable, and for the plot-summary tooltip.
 
 A title-similarity + year filter rejects bad fuzzy matches, so you don't
 accidentally end up with the wrong rating for "Bones (2005)" vs some other show.
@@ -99,7 +99,7 @@ variables override the file.
 
 | Key | What it's for |
 |---|---|
-| `OMDB_API_KEY` | Free key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx) — needed for any rating fetch |
+| `OMDB_API_KEY` | Free key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx). Needed for the plot-summary tooltip, and as the IMDb-rating fallback when IMDb's GraphQL endpoint is unreachable |
 | `FOLDER_ICON_EXE` | Absolute path to Folder-Icon-Creator's `Creator.exe` (only if `ENABLE_CREATE_FOLDER_ICON` is on — it is, by default) |
 | `SONARR_API_KEY` | Sonarr → Settings → General → API Key. Required if you'll trigger from Sonarr |
 | `RADARR_API_KEY` | Radarr → Settings → General → API Key. Required if you'll trigger from Radarr |
@@ -115,6 +115,7 @@ variables override the file.
 | `SEARCH_LANGUAGE` | `ar` | ISO code (`ar`, `en`, `ja`, …) used by the Twitter hashtag filter and OpenSubtitles search URL |
 | `KURYANA_BASE_URL` | `https://kuryana.tbdh.app` | Self-host or alternate mirror |
 | `JIKAN_BASE_URL` | `https://api.jikan.moe/v4` | Self-host or alternate mirror |
+| `IMDB_GRAPHQL_URL` | `https://caching.graphql.imdb.com/` | Override if IMDb ever moves the endpoint |
 | `ARR_FINISHER_LOG_LEVEL` | `INFO` | Set to `DEBUG` for permanently-verbose logs |
 | `ARR_FINISHER_LOG_DIR` | repo dir | Where to write `arr_finisher.log` (falls back to `%TEMP%`) |
 | `ARR_FINISHER_RATING_CACHE_TTL_DAYS` | `7` | How long a rating stays fresh before sweep re-fetches it |
@@ -197,6 +198,7 @@ schtasks /Create /TN "arr_finisher_nightly_sweep" `
 freshness window. To force a full re-fetch on the next run:
 
 ```
+python arr_finisher.py --sweep --force-refresh    :: re-fetch every folder this run
 python arr_finisher.py --clear-cache              :: wipe the entire cache
 python arr_finisher.py --refresh tt7160070        :: invalidate one IMDb ID
 ```
@@ -211,7 +213,9 @@ in `.rollbacks.log` next to the script. Check that file periodically for any
 ```
 python arr_finisher.py --validate                                  # config + connectivity check
 python arr_finisher.py --sweep                                     # rating refresh across all roots
+python arr_finisher.py --sweep --force-refresh                     # bypass the cache TTL and re-fetch every folder
 python arr_finisher.py --sweep --dry-run                           # preview without touching anything
+python arr_finisher.py --regenerate-shortcuts                      # rebuild every Links/ shortcut with current code
 python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"   # single folder (looks up env from Sonarr/Radarr)
 python arr_finisher.py --clear-cache                               # wipe .rating_cache.json
 python arr_finisher.py --refresh tt7160070                         # invalidate one IMDb ID so next sweep re-fetches

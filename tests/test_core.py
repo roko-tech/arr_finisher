@@ -653,3 +653,245 @@ class TestSetupHelp:
         names = [n for n, _ in missing]
         assert "SONARR_API_KEY" in names
         assert "RADARR_API_KEY" not in names
+
+
+# ---------- IMDb GraphQL (primary rating source) ----------
+
+class _FakeHttp:
+    """Minimal stand-in for f.http() — captures the last POST and returns
+    a canned response."""
+    def __init__(self, status=200, body=None):
+        self.last = None
+        self._status = status
+        self._body = body or {}
+    def __call__(self):
+        return self
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.last = {"url": url, "headers": headers, "json": json}
+        class _R:
+            status_code = self._status
+            _body = self._body
+            def json(self_): return self_._body
+        # Bind outer state into _R via closure
+        outer = self
+        class _Resp:
+            status_code = outer._status
+            def json(self_): return outer._body
+        return _Resp()
+
+
+class TestGraphQLRating:
+    def test_returns_formatted_rating(self, monkeypatch):
+        body = {"data": {"title": {"ratingsSummary": {"aggregateRating": 8.3}}}}
+        monkeypatch.setattr(f, "http", _FakeHttp(status=200, body=body))
+        assert f.get_imdb_rating_from_graphql("tt12042730") == "8.3"
+
+    def test_handles_integer_rating(self, monkeypatch):
+        # IMDb sometimes returns ints (e.g. 9 for a perfect score)
+        body = {"data": {"title": {"ratingsSummary": {"aggregateRating": 9}}}}
+        monkeypatch.setattr(f, "http", _FakeHttp(status=200, body=body))
+        assert f.get_imdb_rating_from_graphql("tt0111161") == "9.0"
+
+    def test_missing_aggregateRating_returns_na(self, monkeypatch):
+        body = {"data": {"title": {"ratingsSummary": {}}}}
+        monkeypatch.setattr(f, "http", _FakeHttp(status=200, body=body))
+        assert f.get_imdb_rating_from_graphql("tt9999999") == "N/A"
+
+    def test_missing_title_returns_na(self, monkeypatch):
+        body = {"data": {"title": None}}
+        monkeypatch.setattr(f, "http", _FakeHttp(status=200, body=body))
+        assert f.get_imdb_rating_from_graphql("tt0000000") == "N/A"
+
+    def test_http_error_returns_na(self, monkeypatch):
+        monkeypatch.setattr(f, "http", _FakeHttp(status=500, body={}))
+        assert f.get_imdb_rating_from_graphql("tt1") == "N/A"
+
+    def test_empty_imdb_id_returns_na(self):
+        assert f.get_imdb_rating_from_graphql("") == "N/A"
+        assert f.get_imdb_rating_from_graphql(None) == "N/A"
+
+
+class TestGetImdbRating:
+    """get_imdb_rating: GraphQL first, OMDb fallback."""
+
+    def test_prefers_graphql_over_omdb(self, monkeypatch):
+        monkeypatch.setattr(f, "get_imdb_rating_from_graphql", lambda _id: "8.5")
+        monkeypatch.setattr(f, "get_imdb_rating_from_omdb", lambda _id: "7.0")
+        assert f.get_imdb_rating("tt1") == "8.5"
+
+    def test_falls_back_to_omdb_when_graphql_misses(self, monkeypatch):
+        monkeypatch.setattr(f, "get_imdb_rating_from_graphql", lambda _id: "N/A")
+        monkeypatch.setattr(f, "get_imdb_rating_from_omdb", lambda _id: "7.0")
+        assert f.get_imdb_rating("tt1") == "7.0"
+
+    def test_both_miss_returns_na(self, monkeypatch):
+        monkeypatch.setattr(f, "get_imdb_rating_from_graphql", lambda _id: "N/A")
+        monkeypatch.setattr(f, "get_imdb_rating_from_omdb", lambda _id: "N/A")
+        assert f.get_imdb_rating("tt1") == "N/A"
+
+    def test_empty_imdb_id_returns_na(self):
+        assert f.get_imdb_rating("") == "N/A"
+
+
+# ---------- _load_env_file (matched-quote stripping) ----------
+
+class TestEnvLoader:
+    def _load(self, tmp_path, monkeypatch, lines):
+        # Scrub the keys we're about to set so the "real env wins" guard
+        # doesn't no-op our test data.
+        for line in lines:
+            if "=" in line and not line.strip().startswith("#"):
+                k = line.split("=", 1)[0].strip()
+                monkeypatch.delenv(k, raising=False)
+        path = tmp_path / ".env"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        f._load_env_file(str(path))
+
+    def test_strips_matching_double_quotes(self, tmp_path, monkeypatch):
+        self._load(tmp_path, monkeypatch, ['ARRTEST_DQ="hello"'])
+        assert os.environ["ARRTEST_DQ"] == "hello"
+
+    def test_strips_matching_single_quotes(self, tmp_path, monkeypatch):
+        self._load(tmp_path, monkeypatch, ["ARRTEST_SQ='hello'"])
+        assert os.environ["ARRTEST_SQ"] == "hello"
+
+    def test_preserves_mismatched_quotes(self, tmp_path, monkeypatch):
+        # KEY="a'b" used to become a'b under the naive strip; should stay a'b
+        # (i.e. only the outer quotes are stripped, the inner ' is preserved).
+        self._load(tmp_path, monkeypatch, ["""ARRTEST_MIX="a'b" """])
+        assert os.environ["ARRTEST_MIX"] == "a'b"
+
+    def test_no_quotes_passes_through(self, tmp_path, monkeypatch):
+        self._load(tmp_path, monkeypatch, ["ARRTEST_NQ=plain"])
+        assert os.environ["ARRTEST_NQ"] == "plain"
+
+    def test_real_env_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARRTEST_PRECEDENCE", "from-real-env")
+        path = tmp_path / ".env"
+        path.write_text("ARRTEST_PRECEDENCE=from-file\n", encoding="utf-8")
+        f._load_env_file(str(path))
+        assert os.environ["ARRTEST_PRECEDENCE"] == "from-real-env"
+
+    def test_comment_and_blank_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARRTEST_AFTER_BLANK", raising=False)
+        self._load(tmp_path, monkeypatch, [
+            "# comment",
+            "",
+            "ARRTEST_AFTER_BLANK=ok",
+        ])
+        assert os.environ["ARRTEST_AFTER_BLANK"] == "ok"
+
+
+# ---------- set_folder_tooltip desktop.ini parser/rewriter ----------
+
+class TestTooltipWriter:
+    def test_creates_new_desktop_ini(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        folder = tmp_path / "show"
+        folder.mkdir()
+        f.set_folder_tooltip(str(folder), "Plot summary  [IMDb 8.0]")
+        ini = folder / "desktop.ini"
+        assert ini.exists()
+        content = ini.read_bytes().decode("utf-16")
+        assert "[.ShellClassInfo]" in content
+        assert "InfoTip=Plot summary  [IMDb 8.0]" in content
+
+    def test_replaces_existing_infotip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        folder = tmp_path / "show"
+        folder.mkdir()
+        ini = folder / "desktop.ini"
+        ini.write_bytes(
+            ("[.ShellClassInfo]\r\nInfoTip=OLD\r\nIconResource=poster.ico,0\r\n"
+             ).encode("utf-16")
+        )
+        f.set_folder_tooltip(str(folder), "NEW tooltip")
+        text = ini.read_bytes().decode("utf-16")
+        assert "InfoTip=NEW tooltip" in text
+        assert "InfoTip=OLD" not in text
+        # Existing IconResource line must be preserved.
+        assert "IconResource=poster.ico,0" in text
+
+    def test_idempotent_when_tooltip_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        folder = tmp_path / "show"
+        folder.mkdir()
+        f.set_folder_tooltip(str(folder), "Same tooltip")
+        ini = folder / "desktop.ini"
+        first_mtime = ini.stat().st_mtime_ns
+        # Force a different timestamp by waiting 1 ms, then re-set with the
+        # same value. The file should not be rewritten.
+        import time as _t
+        _t.sleep(0.01)
+        f.set_folder_tooltip(str(folder), "Same tooltip")
+        assert ini.stat().st_mtime_ns == first_mtime
+
+    def test_disabled_toggle_short_circuits(self, tmp_path, monkeypatch):
+        # Carried-over coverage from TestTooltipToggle, but consolidated here.
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", False)
+        folder = tmp_path / "show"
+        folder.mkdir()
+        f.set_folder_tooltip(str(folder), "ignored")
+        assert not (folder / "desktop.ini").exists()
+
+
+# ---------- create_folder_icon: only skip when icon already declared ----------
+
+class TestFolderIconSkip:
+    def test_tooltip_only_desktop_ini_does_not_block_icon(self, tmp_path, monkeypatch):
+        # Simulate the scenario: an earlier run wrote a tooltip (so
+        # desktop.ini exists) but never wrote an IconResource line. A later
+        # run with ENABLE_CREATE_FOLDER_ICON=True must NOT short-circuit.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "desktop.ini").write_bytes(
+            "[.ShellClassInfo]\r\nInfoTip=tooltip without icon\r\n".encode("utf-16")
+        )
+        called = {"n": 0}
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: called.__setitem__("n", called["n"] + 1))
+        f.create_folder_icon(str(folder))
+        assert called["n"] == 1   # Creator.exe was invoked
+
+    def test_desktop_ini_with_icon_resource_skips(self, tmp_path, monkeypatch):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "desktop.ini").write_bytes(
+            "[.ShellClassInfo]\r\nIconResource=poster.ico,0\r\n".encode("utf-16")
+        )
+        called = {"n": 0}
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: called.__setitem__("n", called["n"] + 1))
+        f.create_folder_icon(str(folder))
+        assert called["n"] == 0   # short-circuited
+
+
+# ---------- _save_rating_cache dirty flag ----------
+
+class TestRatingCacheDirtyFlag:
+    def test_no_write_when_clean(self, monkeypatch, tmp_path):
+        cache_path = tmp_path / ".rating_cache.json"
+        cache_path.write_text('{"tt1":{"checked_at":1,"rating":"8.0","source":"IMDb"}}')
+        before_mtime = cache_path.stat().st_mtime_ns
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_path))
+        monkeypatch.setattr(f, "_rating_cache", None)
+        monkeypatch.setattr(f, "_rating_cache_dirty", False)
+        # Force a lazy load (mark cache as loaded but not dirty)
+        f._load_rating_cache()
+        f._save_rating_cache()
+        # File should be untouched — no write happened.
+        assert cache_path.stat().st_mtime_ns == before_mtime
+
+    def test_writes_after_set(self, monkeypatch, tmp_path):
+        cache_path = tmp_path / ".rating_cache.json"
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_path))
+        monkeypatch.setattr(f, "_rating_cache", {})
+        monkeypatch.setattr(f, "_rating_cache_dirty", False)
+        f._rating_cache_set("tt99", "8.4", "IMDb")
+        f._save_rating_cache()
+        assert cache_path.exists()
+        import json as _json
+        loaded = _json.loads(cache_path.read_text())
+        assert "tt99" in loaded
