@@ -1185,68 +1185,8 @@ def create_shortcuts(service, folder_path, imdb_id, tmdb_or_tvdb_id, title, is_k
     if imdb_id and ENABLE_SHORTCUT_IMDB:
         make_link("IMDb", f"https://www.imdb.com/title/{imdb_id}/")
 
-    # Parents guide: a single click opens IMDb parental guide + Common Sense
-    # Media + Does The Dog Die in three tabs. IMDb is community-edited and
-    # often sparse on newer titles; CSM has curated age/content scores; DTDD
-    # covers triggers IMDb skips. Same pattern as the combined Subtitle shortcut.
     if imdb_id and ENABLE_SHORTCUT_PARENTAL:
-        try:
-            imdb_pg_url = f"https://www.imdb.com/title/{quote(imdb_id)}/parentalguide/"
-            clean_title = re.sub(r'\s*\(\d{4}\)$', '', title or '').strip()
-            title_q = quote(clean_title) if clean_title else ""
-            csm_url = (f"https://www.commonsensemedia.org/search?query={title_q}"
-                       if title_q else "https://www.commonsensemedia.org/")
-            dtdd_url = (f"https://www.doesthedogdie.com/search?text={title_q}"
-                        if title_q else "https://www.doesthedogdie.com/")
-            # URLs go into a VBS literal — reject anything with quotes/newlines.
-            if not _is_safe_url(imdb_pg_url):
-                imdb_pg_url = "https://www.imdb.com/"
-            if not _is_safe_url(csm_url):
-                csm_url = "https://www.commonsensemedia.org/"
-            if not _is_safe_url(dtdd_url):
-                dtdd_url = "https://www.doesthedogdie.com/"
-
-            vbs_path = os.path.join(links_dir, "Parents guide.vbs")
-            lnk_path = os.path.join(links_dir, "Parents guide.lnk")
-
-            # Migration: old version was a single .lnk pointing straight at the
-            # IMDb parental-guide URL. When the .vbs is being written for the
-            # first time, delete the stale .lnk so the next _write_lnk call
-            # regenerates it pointing at the .vbs.
-            if not os.path.exists(vbs_path) and os.path.exists(lnk_path):
-                try: os.remove(lnk_path)
-                except Exception: pass
-
-            # Rewrite the .vbs if missing OR if URLs drifted (drift-aware,
-            # same as Subtitle.vbs).
-            content = (
-                'Set sh = CreateObject("WScript.Shell")\n'
-                f'sh.Run "explorer.exe ""{imdb_pg_url}""", 1, False\n'
-                'WScript.Sleep 200\n'
-                f'sh.Run "explorer.exe ""{csm_url}""", 1, False\n'
-                'WScript.Sleep 200\n'
-                f'sh.Run "explorer.exe ""{dtdd_url}""", 1, False\n'
-            )
-            existing = ""
-            if os.path.exists(vbs_path):
-                try:
-                    with open(vbs_path, "r", encoding="utf-8") as fh:
-                        existing = fh.read()
-                except OSError:
-                    pass
-            if existing != content:
-                if DRY_RUN:
-                    log(f"[DRY RUN] Would write Parents guide.vbs opening IMDb/CSM/DTDD")
-                else:
-                    _set_file_attrs(vbs_path, remove=_FILE_ATTRIBUTE_HIDDEN)
-                    tmp_vbs = vbs_path + ".tmp"
-                    with open(tmp_vbs, "w", encoding="utf-8") as fh:
-                        fh.write(content)
-                    os.replace(tmp_vbs, vbs_path)
-                    _set_file_attrs(vbs_path, add=_FILE_ATTRIBUTE_HIDDEN)
-            _write_lnk(lnk_path, vbs_path, "Parents guide")
-        except Exception as e:
-            log_err(f"Failed creating Parents guide shortcut: {e}")
+        make_link("Parents guide", f"https://www.imdb.com/title/{imdb_id}/parentalguide/#nudity")
 
     if ENABLE_SHORTCUT_TWITTER and title:
         try:

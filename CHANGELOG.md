@@ -2,19 +2,6 @@
 
 All notable changes to arr_finisher are listed here. Versions follow [SemVer](https://semver.org).
 
-## Unreleased
-
-### Changed
-- **Parents guide shortcut is now a combined multi-tab opener.** One click
-  on `Parents guide.lnk` opens IMDb's parental guide, Common Sense Media,
-  and Does The Dog Die in three tabs (was: a single link to IMDb's parental
-  guide, anchored to the nudity section). IMDb is community-edited and often
-  sparse on newer titles; CSM has curated age/content scores; DTDD covers
-  triggers IMDb skips. Same `.vbs` wrapper pattern as the existing Subtitle
-  shortcut, with the same drift-aware rewrite and URL-safety checks.
-- Existing single-link `Parents guide.lnk` is auto-migrated on the next
-  webhook fire (or `--regenerate-shortcuts`) to point at the new `.vbs`.
-
 ## [1.0.0] — 2026-05-16
 
 First versioned release. Marks the post-review baseline: all known critical
