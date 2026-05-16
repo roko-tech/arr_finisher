@@ -11,11 +11,14 @@ import json
 import logging
 import unicodedata
 import ctypes
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from urllib.parse import quote
 from contextlib import contextmanager
 
 import requests
+
+__version__ = "1.0.0"
 
 # Try optional pywin32 for .lnk creation; degrade gracefully if missing
 try:
@@ -664,6 +667,18 @@ def _save_rating_cache():
         except OSError:
             pass
 
+def _parse_checked_at(value):
+    """Accept either an ISO-8601 string (new) or a float epoch (legacy).
+    Returns float epoch, or None if unparseable."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            return datetime.fromisoformat(value).timestamp()
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
 def _rating_cache_is_fresh(imdb_id):
     """True if the cached rating for imdb_id is younger than RATING_CACHE_TTL_DAYS."""
     if not imdb_id:
@@ -672,18 +687,20 @@ def _rating_cache_is_fresh(imdb_id):
     entry = cache.get(imdb_id)
     if not entry:
         return False
-    try:
-        age_days = (time.time() - float(entry.get("checked_at", 0))) / 86400.0
-        return age_days < RATING_CACHE_TTL_DAYS
-    except Exception:
+    ts = _parse_checked_at(entry.get("checked_at"))
+    if ts is None:
         return False
+    age_days = (time.time() - ts) / 86400.0
+    return age_days < RATING_CACHE_TTL_DAYS
 
 def _rating_cache_set(imdb_id, rating, source):
     if not imdb_id:
         return
     cache = _load_rating_cache()
     cache[imdb_id] = {
-        "checked_at": time.time(),
+        # ISO 8601 (local time, second precision) — `cat .rating_cache.json`
+        # is now readable. Legacy float-epoch entries are still understood.
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
         "rating": rating,
         "source": source,
     }
@@ -1654,23 +1671,56 @@ def _parse_roots_arg(values):
         out.append((p, s))
     return out
 
+_HARDCODED_FALLBACK_ROOTS = [
+    (r"D:\TV Shows", "sonarr"),
+    (r"D:\Anime",    "sonarr"),
+    (r"E:\Movies",   "radarr"),
+]
+
+# Backward-compat alias (other code/users may reference this constant).
+DEFAULT_SWEEP_ROOTS = _HARDCODED_FALLBACK_ROOTS
+
+def _discover_sweep_roots():
+    """Query Sonarr and Radarr for their configured root folders, returning
+    [(path, service), ...]. Returns [] if neither service is configured or
+    reachable. Short timeout so a single down service doesn't stall sweep."""
+    out = []
+    for service, base, key in (("sonarr", SONARR_API_URL, SONARR_API_KEY),
+                               ("radarr", RADARR_API_URL, RADARR_API_KEY)):
+        if not key:
+            continue
+        try:
+            r = http().get(f"{base}/api/v3/rootfolder",
+                           headers={"X-Api-Key": key}, timeout=5)
+            if r.status_code != 200:
+                continue
+            for entry in (r.json() or []):
+                p = entry.get("path") or ""
+                if p:
+                    out.append((os.path.normpath(p), service))
+        except Exception as e:
+            log_debug(f"{service} root discovery failed: {_redact(e)}")
+    return out
+
 def _default_sweep_roots():
-    """Read sweep roots from ARR_FINISHER_SWEEP_ROOTS if set, else use hardcoded
-    fallback. Env-var format: 'D:\\TV Shows:sonarr|D:\\Movies:radarr' (pipe-separated)."""
+    """Decide which sweep roots to walk. Precedence:
+      1. ARR_FINISHER_SWEEP_ROOTS env var (pipe-separated path:service pairs).
+      2. Auto-discovery from Sonarr/Radarr /api/v3/rootfolder.
+      3. Hardcoded fallback (the original-author defaults).
+    """
     env_val = os.environ.get("ARR_FINISHER_SWEEP_ROOTS", "").strip()
     if env_val:
         try:
             return _parse_roots_arg([s for s in env_val.split("|") if s.strip()])
         except ValueError as e:
-            log_err(f"Bad ARR_FINISHER_SWEEP_ROOTS: {e}; using hardcoded defaults")
-    return [
-        (r"D:\TV Shows", "sonarr"),
-        (r"D:\Anime",    "sonarr"),
-        (r"E:\Movies",   "radarr"),
-    ]
-
-# Kept for backward-compat / tests that reference the module attribute.
-DEFAULT_SWEEP_ROOTS = _default_sweep_roots()
+            log_err(f"Bad ARR_FINISHER_SWEEP_ROOTS: {e}; trying auto-discovery")
+    discovered = _discover_sweep_roots()
+    if discovered:
+        log(f"Auto-discovered sweep roots from services: {discovered}")
+        return discovered
+    log_warn("No sweep roots configured and auto-discovery yielded nothing; "
+             "using hardcoded fallback. Set ARR_FINISHER_SWEEP_ROOTS or use --roots.")
+    return _HARDCODED_FALLBACK_ROOTS
 
 class _EventCounter(logging.Handler):
     """Counts log records matching known event patterns. Used for sweep summary."""
@@ -1776,6 +1826,54 @@ def clear_rating_cache(imdb_id=None):
     return 0
 
 # ==========================
+# Setup-help sidecar
+# ==========================
+_SETUP_HELP_PATH = os.path.join(SCRIPT_DIR, "arr_finisher_setup.txt")
+
+def _check_critical_config(sonarr_event=None, radarr_event=None):
+    """Return list of (var_name, help_text) for missing critical config.
+    `sonarr_event` / `radarr_event` are the lowercased event names — when set,
+    we require the matching service API key."""
+    missing = []
+    if not OMDB_API_KEY:
+        missing.append(("OMDB_API_KEY",
+                        "Free key from https://www.omdbapi.com/apikey.aspx — "
+                        "required for any rating fetch."))
+    if sonarr_event and not SONARR_API_KEY:
+        missing.append(("SONARR_API_KEY",
+                        "Sonarr → Settings → General → API Key"))
+    if radarr_event and not RADARR_API_KEY:
+        missing.append(("RADARR_API_KEY",
+                        "Radarr → Settings → General → API Key"))
+    if ENABLE_CREATE_FOLDER_ICON and (not FOLDER_ICON_EXE
+                                       or not os.path.isfile(FOLDER_ICON_EXE)):
+        missing.append(("FOLDER_ICON_EXE",
+                        "Absolute path to Folder-Icon-Creator's Creator.exe. "
+                        "See README install steps."))
+    return missing
+
+def _update_setup_help(missing):
+    """Write or remove the setup-help sidecar based on `missing` config items."""
+    if not missing:
+        try:
+            os.remove(_SETUP_HELP_PATH)
+        except OSError:
+            pass
+        return
+    try:
+        with open(_SETUP_HELP_PATH, "w", encoding="utf-8") as fh:
+            fh.write("arr_finisher needs configuration before it can do its job.\n")
+            fh.write(f"Last checked: {datetime.now().isoformat(timespec='seconds')}\n\n")
+            fh.write("Edit `.env` in the repo directory and set:\n\n")
+            for name, hint in missing:
+                fh.write(f"  - {name}\n      {hint}\n\n")
+            fh.write("Then re-trigger the import in Sonarr/Radarr, or run:\n")
+            fh.write("  python arr_finisher.py --validate\n")
+            fh.write("for a full health check.\n")
+    except OSError:
+        pass
+
+# ==========================
 # Entrypoint
 # ==========================
 def main():
@@ -1803,6 +1901,7 @@ def main():
                              "(next sweep will re-fetch it).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable DEBUG-level logging (idempotent 'Already exists' etc.).")
+    parser.add_argument("--version", action="version", version=f"arr_finisher {__version__}")
     args = parser.parse_args()
 
     if args.verbose:
@@ -1823,6 +1922,19 @@ def main():
         return clear_rating_cache(args.refresh)
     if args.validate:
         return validate_config()
+
+    # For real work (sweep, manual, webhook): refresh the setup-help sidecar.
+    sonarr_event = os.environ.get("Sonarr_EventType", "").lower()
+    radarr_event = os.environ.get("Radarr_EventType", "").lower()
+    missing = _check_critical_config(sonarr_event=sonarr_event, radarr_event=radarr_event)
+    _update_setup_help(missing)
+    if missing:
+        names = ", ".join(name for name, _ in missing)
+        log_err(f"Missing config: {names}. See {_SETUP_HELP_PATH} for setup help.")
+        # Webhook callers expect a quiet exit — don't error if the user is
+        # running for the first time. They'll see the sidecar.
+        return 0 if (sonarr_event or radarr_event) else 1
+
     if args.sweep:
         return sweep_library(args.roots or None)
     if args.service and args.path:
@@ -1836,8 +1948,6 @@ def main():
         return 0
 
     # Default: arr webhook (env-driven)
-    sonarr_event = os.environ.get("Sonarr_EventType", "").lower()
-    radarr_event = os.environ.get("Radarr_EventType", "").lower()
     if sonarr_event == "test" or radarr_event == "test":
         log(f"{(sonarr_event or radarr_event).capitalize()} test event — OK")
         return 0

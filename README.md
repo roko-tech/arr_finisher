@@ -88,6 +88,13 @@ Trigger on `On Import` and `On Upgrade`. The `.bat` auto-locates the `.py` via
 `%~dp0`, so you can keep the repo anywhere. The `Test` event Sonarr/Radarr fires
 when you click "Test" in the UI is acknowledged but does nothing.
 
+**First-run troubleshooting.** The webhook silently swallows stdout/stderr (so a
+crash never breaks Sonarr/Radarr's import flow). To make missing config
+visible, the script writes an `arr_finisher_setup.txt` next to itself when it
+detects missing/invalid `OMDB_API_KEY`, `SONARR_API_KEY`, `RADARR_API_KEY`, or
+`FOLDER_ICON_EXE`. The file lists what's missing and how to fix it; it's
+auto-deleted once config is healthy.
+
 ### 2. Nightly sweep (rating-refresh safety net)
 
 The webhook handles every new import in full. The sweep is a **rating-only**
@@ -131,19 +138,18 @@ python arr_finisher.py --verbose                                  # include DEBU
 
 ### Sweep roots
 
-Default roots come from `ARR_FINISHER_SWEEP_ROOTS` (pipe-separated `path:service` pairs).
-If that env var is unset, the hardcoded fallback in `_default_sweep_roots` is used:
+Resolved in this order, first hit wins:
 
-```python
-[
-    (r"D:\TV Shows", "sonarr"),
-    (r"D:\Anime",    "sonarr"),
-    (r"E:\Movies",   "radarr"),
-]
-```
+1. `--roots "D:\Shows:sonarr" "F:\Movies:radarr"` on the CLI (the service is
+   matched on the last colon, so Windows drive letters in the path are fine).
+2. `ARR_FINISHER_SWEEP_ROOTS` env var — pipe-separated `path:service` pairs.
+3. **Auto-discovery** — Sonarr `/api/v3/rootfolder` and Radarr `/api/v3/rootfolder`
+   are queried. Their configured root folders become the sweep roots.
+4. Hardcoded fallback (`D:\TV Shows`, `D:\Anime`, `E:\Movies`) — only used when
+   no service is reachable.
 
-Override per-invocation with `--roots "D:\Shows:sonarr" "F:\Movies:radarr"` (the
-service is matched on the last colon, so Windows drive letters in the path are fine).
+Auto-discovery means you don't need to configure roots at all if your Sonarr /
+Radarr instances are healthy when the sweep runs.
 
 ---
 
