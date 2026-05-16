@@ -284,3 +284,187 @@ class TestDryRun:
         f.process_sonarr(folder)
         assert os.path.isdir(folder)                      # original still there
         assert not os.path.isdir(folder + " [MDL 7.5]")   # renamed path NOT created
+
+
+# ---------- --roots CLI parsing (regression for the rsplit fix) ----------
+
+class TestRootsParsing:
+    def test_windows_drive_letter_in_path(self):
+        # 'D:\TV Shows:sonarr' has TWO colons — must rsplit so service is `sonarr`.
+        result = f._parse_roots_arg([r"D:\TV Shows:sonarr"])
+        assert result == [(r"D:\TV Shows", "sonarr")]
+
+    def test_multiple_entries(self):
+        result = f._parse_roots_arg([r"D:\TV:sonarr", r"E:\Movies:radarr"])
+        assert result == [(r"D:\TV", "sonarr"), (r"E:\Movies", "radarr")]
+
+    def test_unknown_service_rejected(self):
+        with pytest.raises(ValueError):
+            f._parse_roots_arg([r"D:\Foo:notaservice"])
+
+    def test_missing_colon_rejected(self):
+        with pytest.raises(ValueError):
+            f._parse_roots_arg([r"D:\Foo"])
+
+
+# ---------- rename_folder merge: must NOT delete conflicting items ----------
+
+class TestRenameMerge:
+    def test_merge_with_conflict_leaves_source(self, staging):
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        # Same filename exists in BOTH — must not be silently destroyed.
+        open(os.path.join(old, "ep1.mkv"), "wb").write(b"old-content-keep-me")
+        open(os.path.join(new, "ep1.mkv"), "wb").write(b"new-content")
+        # And a non-conflicting file that should successfully move.
+        open(os.path.join(old, "ep2.mkv"), "wb").write(b"unique")
+
+        f.rename_folder(old, "8.0", "IMDb")
+
+        # The conflicting file in the SOURCE must still exist (not deleted).
+        assert os.path.isfile(os.path.join(old, "ep1.mkv"))
+        # The unique file moved successfully.
+        assert os.path.isfile(os.path.join(new, "ep2.mkv"))
+        # The destination still has its original ep1.mkv (we didn't overwrite).
+        with open(os.path.join(new, "ep1.mkv"), "rb") as fh:
+            assert fh.read() == b"new-content"
+
+    def test_merge_clean_removes_source(self, staging):
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        open(os.path.join(old, "ep1.mkv"), "wb").write(b"moves-cleanly")
+
+        f.rename_folder(old, "8.0", "IMDb")
+
+        assert not os.path.isdir(old)
+        assert os.path.isfile(os.path.join(new, "ep1.mkv"))
+
+
+# ---------- URL safety filter (Subtitle.vbs injection guard) ----------
+
+class TestUrlSafety:
+    def test_accepts_plain_https(self):
+        assert f._is_safe_url("https://www.opensubtitles.com/en/movies/2024-foo")
+
+    def test_rejects_double_quote(self):
+        assert not f._is_safe_url('https://evil.example/" Set fso = ...')
+
+    def test_rejects_newline(self):
+        assert not f._is_safe_url("https://x.example/a\nb")
+
+    def test_rejects_non_http(self):
+        assert not f._is_safe_url("javascript:alert(1)")
+        assert not f._is_safe_url("file:///c:/secret")
+
+    def test_rejects_empty(self):
+        assert not f._is_safe_url("")
+        assert not f._is_safe_url(None)
+
+
+# ---------- Log redaction ----------
+
+class TestRedaction:
+    def test_redacts_omdb_key(self, monkeypatch):
+        monkeypatch.setattr(f, "OMDB_API_KEY", "SECRET_KEY_12345")
+        msg = "GET https://www.omdbapi.com/?apikey=SECRET_KEY_12345&i=tt1 failed"
+        assert "SECRET_KEY_12345" not in f._redact(msg)
+        assert "<redacted>" in f._redact(msg)
+
+    def test_pass_through_when_no_secret(self, monkeypatch):
+        monkeypatch.setattr(f, "OMDB_API_KEY", "")
+        assert f._redact("nothing to redact") == "nothing to redact"
+
+
+# ---------- Sweep mode: cache TTL, env stuffing ----------
+
+class TestSweep:
+    def test_sweep_one_stuffs_env_and_processes(self, staging, make_series,
+                                                 patch_providers, monkeypatch, clear_env_vars):
+        folder = make_series("The Boys (2019)")
+        patch_providers["imdb_rating"] = "8.6"
+        fake_obj = {"id": 42, "imdbId": "tt1190634", "tvdbId": 355567,
+                    "title": "The Boys", "year": 2019,
+                    "originalLanguage": {"name": "English"}, "seriesType": "standard"}
+        monkeypatch.setattr(f, "get_object_by_path", lambda svc, p: fake_obj)
+        assert f._sweep_one("sonarr", folder) is True
+        # Sweep doesn't create shortcuts/icons/tooltips — only renames.
+        assert os.path.isdir(folder + " [IMDb 8.6]")
+        # Cache should now have an entry for this IMDb ID.
+        assert "tt1190634" in f._load_rating_cache()
+
+    def test_sweep_one_returns_false_for_unknown(self, staging, make_series, monkeypatch):
+        folder = make_series("Unknown Show (2024)")
+        monkeypatch.setattr(f, "get_object_by_path", lambda svc, p: None)
+        assert f._sweep_one("sonarr", folder) is False
+
+    def test_rating_cache_freshness_skips(self, monkeypatch):
+        # Force a cache entry that's brand new.
+        monkeypatch.setattr(f, "_rating_cache", {"tt9999": {"checked_at": __import__("time").time(),
+                                                             "rating": "9.0", "source": "IMDb"}})
+        assert f._rating_cache_is_fresh("tt9999") is True
+
+    def test_rating_cache_stale_does_not_skip(self, monkeypatch):
+        import time as _t
+        monkeypatch.setattr(f, "_rating_cache", {"tt9999": {"checked_at": _t.time() - 999 * 86400,
+                                                             "rating": "9.0", "source": "IMDb"}})
+        assert f._rating_cache_is_fresh("tt9999") is False
+
+
+# ---------- --clear-cache / --refresh ----------
+
+class TestCacheCommands:
+    def test_clear_cache_deletes_file(self, monkeypatch, tmp_path):
+        cache_file = tmp_path / ".rating_cache.json"
+        cache_file.write_text('{"tt1":{"checked_at":1,"rating":"8.0","source":"IMDb"}}')
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_file))
+        monkeypatch.setattr(f, "_rating_cache", None)
+        assert f.clear_rating_cache() == 0
+        assert not cache_file.exists()
+
+    def test_refresh_removes_single_entry(self, monkeypatch, tmp_path):
+        cache_file = tmp_path / ".rating_cache.json"
+        cache_file.write_text(
+            '{"tt1":{"checked_at":1,"rating":"8.0","source":"IMDb"},'
+            ' "tt2":{"checked_at":2,"rating":"7.0","source":"IMDb"}}'
+        )
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_file))
+        monkeypatch.setattr(f, "_rating_cache", None)
+        assert f.clear_rating_cache("tt1") == 0
+        # The cache file should still exist with tt2 intact.
+        assert cache_file.exists()
+        import json as _json
+        remaining = _json.loads(cache_file.read_text())
+        assert "tt1" not in remaining
+        assert "tt2" in remaining
+
+
+# ---------- Tooltip toggle (ENABLE_SET_TOOLTIP) ----------
+
+class TestTooltipToggle:
+    def test_disabled_toggle_short_circuits(self, staging, make_series, monkeypatch):
+        folder = make_series("Anything (2024)")
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", False)
+        f.set_folder_tooltip(folder, "Some plot")
+        # Nothing was written.
+        assert not os.path.exists(os.path.join(folder, "desktop.ini"))
+
+
+# ---------- OMDb response caching (S6) ----------
+
+class TestOmdbCaching:
+    def test_single_fetch_serves_both_callers(self, monkeypatch):
+        calls = {"n": 0}
+        def fake_get(url, timeout=15):
+            calls["n"] += 1
+            class _R:
+                status_code = 200
+                def json(self_): return {"imdbRating": "8.6", "Plot": "A pithy summary."}
+            return _R()
+        monkeypatch.setattr(f, "OMDB_API_KEY", "fake")
+        monkeypatch.setattr(f, "_omdb_response_cache", {})
+        monkeypatch.setattr(f, "http", lambda: type("S", (), {"get": staticmethod(fake_get)})())
+        assert f.get_imdb_rating_from_omdb("tt1234567") == "8.6"
+        assert f.get_omdb_plot("tt1234567") == "A pithy summary."
+        assert calls["n"] == 1   # cached

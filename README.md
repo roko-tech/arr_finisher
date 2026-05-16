@@ -42,7 +42,7 @@ accidentally end up with the wrong rating for "Bones (2005)" vs some other show.
 git clone https://github.com/roko-tech/arr_finisher.git
 cd arr_finisher
 python -m pip install -r requirements.txt
-cp .env.example .env
+copy .env.example .env
 ```
 
 Then edit `.env` with your API keys (see [Configure](#configure) below) and verify:
@@ -70,6 +70,9 @@ variables override the file.
 | `SEARCH_LANGUAGE` | | ISO code (`ar`, `en`, `ja`, …) for the Twitter hashtag filter + OpenSubtitles listing. Defaults to `ar` |
 | `KURYANA_BASE_URL` / `JIKAN_BASE_URL` | | Mirror overrides if you self-host |
 | `ARR_FINISHER_LOG_LEVEL` | | `DEBUG` for verbose permanently; default `INFO` |
+| `ARR_FINISHER_LOG_DIR` | | Directory for `arr_finisher.log`. Defaults to the repo dir, with `%TEMP%` as fallback |
+| `ARR_FINISHER_RATING_CACHE_TTL_DAYS` | | Sweep cache freshness window. Default `7` |
+| `ARR_FINISHER_SWEEP_ROOTS` | | Pipe-separated `path:service` pairs used by `--sweep` when `--roots` is not passed |
 
 ---
 
@@ -82,7 +85,8 @@ Three ways to invoke it:
 **Settings → Connect → Custom Script** → `<repo>\arr_finisher.bat`.
 
 Trigger on `On Import` and `On Upgrade`. The `.bat` auto-locates the `.py` via
-`%~dp0`, so you can keep the repo anywhere.
+`%~dp0`, so you can keep the repo anywhere. The `Test` event Sonarr/Radarr fires
+when you click "Test" in the UI is acknowledged but does nothing.
 
 ### 2. Nightly sweep (rating-refresh safety net)
 
@@ -119,23 +123,27 @@ Delete `.rating_cache.json` to force a full refresh on the next sweep.
 python arr_finisher.py --validate                                 # config + connectivity check
 python arr_finisher.py --sweep                                    # process every folder
 python arr_finisher.py --sweep --dry-run                          # preview without touching anything
-python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"  # single folder
+python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"  # single folder (looks up env vars from Sonarr/Radarr)
+python arr_finisher.py --clear-cache                              # wipe .rating_cache.json
+python arr_finisher.py --refresh tt7160070                        # invalidate one IMDb ID so next sweep re-fetches
 python arr_finisher.py --verbose                                  # include DEBUG-level logs
 ```
 
 ### Sweep roots
 
-Default roots are defined at the top of `sweep_library` in `arr_finisher.py`:
+Default roots come from `ARR_FINISHER_SWEEP_ROOTS` (pipe-separated `path:service` pairs).
+If that env var is unset, the hardcoded fallback in `_default_sweep_roots` is used:
 
 ```python
-DEFAULT_SWEEP_ROOTS = [
+[
     (r"D:\TV Shows", "sonarr"),
     (r"D:\Anime",    "sonarr"),
     (r"E:\Movies",   "radarr"),
 ]
 ```
 
-Override per-invocation with `--roots "D:\Shows:sonarr" "F:\Movies:radarr"`.
+Override per-invocation with `--roots "D:\Shows:sonarr" "F:\Movies:radarr"` (the
+service is matched on the last colon, so Windows drive letters in the path are fine).
 
 ---
 
