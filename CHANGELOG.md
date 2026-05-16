@@ -23,6 +23,16 @@ test coverage and atomic disk operations.
 - 21 new tests covering `--roots` parsing, rename-merge conflicts, URL
   safety, log redaction, sweep env-var stuffing, cache TTL, cache commands,
   and OMDb response caching.
+- `get_imdb_rating_from_graphql`: IMDb's public GraphQL endpoint (no API
+  key) is now the primary IMDb-rating source. Returns live ratings; OMDb
+  remains the fallback for when GraphQL is unreachable.
+- `ProviderUnavailable` exception raised by `get_mal_rating` and
+  `get_mdl_rating` on transient errors (5xx / 429 / network) — the
+  rating dispatcher in `_process` catches it and preserves the folder's
+  existing rating instead of silently rebadging anime as IMDb when Jikan
+  is down. (Real-world bug: 13 anime folders were rebadged during a Jikan
+  outage before this fix.)
+- 4 regression tests pinning the new provider-error semantics.
 
 ### Changed
 - Rating-cache `checked_at` is now an ISO-8601 string (legacy float-epoch
@@ -32,11 +42,17 @@ test coverage and atomic disk operations.
 - Webhook mode persists the rating cache on exit so the next sweep starts warm.
 - OMDb responses cached per process — rating + plot share a single request.
 - `--validate` probes all Kuryana mirrors (pass if any responds) and
-  optionally probes SubDL + OpenSubtitles when their keys are set.
+  optionally probes SubDL + OpenSubtitles when their keys are set. Also
+  probes the IMDb GraphQL endpoint (primary rating source).
 - All `subprocess attrib` shell calls replaced with `ctypes.SetFileAttributesW`.
 - Logger is named (`arr_finisher`), not the root logger.
 - `_fs_lock` retries on contention and reclaims stale (>10 min) lock dirs
   instead of silently proceeding without a lock.
+- Sweep TTL skip now requires the folder to ALREADY carry a rating suffix.
+  Folders that are missing one (newly added, or stripped by the user) are
+  always re-checked, regardless of cache age.
+- Twitter shortcut OR clause is parenthesized so `lang:<code>` applies to
+  the whole alternation rather than only the last term.
 
 ### Fixed
 - `--sweep --roots "D:\TV Shows:sonarr"` now parses correctly (was a
@@ -60,3 +76,6 @@ test coverage and atomic disk operations.
 - Stray `Sonarr_Movie_OriginalLanguage` / `Radarr_Series_OriginalLanguage`
   keys from the language env-var probe list (Sonarr has no movies; Radarr
   has no series).
+- `_extract_from_jsonld` — the HTML JSON-LD scrape stopped working when
+  IMDb moved behind AWS WAF (every `requests` call returns HTTP 202 with
+  an empty body until JavaScript clears the challenge). GraphQL replaces it.

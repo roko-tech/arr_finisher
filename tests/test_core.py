@@ -38,6 +38,54 @@ class TestRatingDispatch:
         assert f.get_rating_for_title("tt1", "X", "2023", is_korean=True, is_anime=True) == ("9.0", "MAL")
 
 
+# ---------- Provider-error semantics (no silent fallback to IMDb) ----------
+
+class TestProviderUnavailable:
+    """Regression: when MAL/MDL has a transient outage (5xx, timeout) the
+    dispatcher must propagate ProviderUnavailable instead of silently
+    falling back to IMDb. Otherwise anime gets re-rated as IMDb every time
+    Jikan goes down, triggering destructive folder renames — a real bug
+    that rebadged 13 anime folders during a Jikan outage."""
+
+    def test_mal_provider_unavailable_propagates(self, monkeypatch):
+        def boom(title, year=None):
+            raise f.ProviderUnavailable("Jikan returned 504")
+        monkeypatch.setattr(f, "get_mal_rating", boom)
+        with pytest.raises(f.ProviderUnavailable):
+            f.get_rating_for_title("tt1", "Frieren", "2023", is_anime=True)
+
+    def test_mdl_provider_unavailable_propagates(self, monkeypatch):
+        def boom(title, year=None):
+            raise f.ProviderUnavailable("All kuryana mirrors unavailable")
+        monkeypatch.setattr(f, "get_mdl_rating", boom)
+        with pytest.raises(f.ProviderUnavailable):
+            f.get_rating_for_title("tt1", "Reverse", "2026", is_korean=True)
+
+    def test_mal_none_still_falls_back_to_imdb(self, patch_providers):
+        # None (legitimate no-match) — fallback is the desired behavior.
+        patch_providers["mal_rating"] = None
+        patch_providers["imdb_rating"] = "7.0"
+        assert f.get_rating_for_title("tt1", "X", "2023", is_anime=True) == ("7.0", "IMDb")
+
+    def test_process_sonarr_keeps_folder_on_provider_outage(self, staging, make_series, patch_providers, monkeypatch, clear_env_vars):
+        """End-to-end: anime folder with [MAL X.X] suffix must NOT be renamed
+        to [IMDb Y.Y] when Jikan is down."""
+        folder = make_series("Some Anime (2024) [MAL 8.5]")
+        def boom(title, year=None):
+            raise f.ProviderUnavailable("Jikan returned 504")
+        monkeypatch.setattr(f, "get_mal_rating", boom)
+        patch_providers["imdb_rating"] = "7.0"   # would-be wrong fallback
+        os.environ.update({
+            "Sonarr_Series_Id": "1", "Sonarr_Series_ImdbId": "tt1",
+            "Sonarr_Series_Title": "Some Anime (2024)", "Sonarr_Series_Year": "2024",
+            "Sonarr_Series_Type": "anime",
+        })
+        f.process_sonarr(folder)
+        # Folder must keep its MAL suffix; no IMDb-renamed twin must exist.
+        assert os.path.isdir(folder), "Original [MAL] folder must remain"
+        assert not os.path.isdir(folder.replace("[MAL 8.5]", "[IMDb 7.0]"))
+
+
 # ---------- Suffix handling ----------
 
 class TestSuffixStripping:

@@ -28,6 +28,15 @@ try:
 except Exception:
     HAS_WIN32COM = False
 
+# Raised when a rating provider has a transient outage (5xx, timeout, network
+# error). The caller should keep the folder's existing rating rather than
+# falling back to a different provider — otherwise an anime that's normally
+# rated by MAL gets re-rated as IMDb while Jikan is down, then incorrectly
+# renamed. Returning None silently from get_mal_rating / get_mdl_rating used
+# to cause exactly that bug (13 anime folders rebadged during a real outage).
+class ProviderUnavailable(Exception):
+    pass
+
 # ==========================
 # .env loader (no external dependency)
 # ==========================
@@ -590,29 +599,42 @@ def get_imdb_rating_from_omdb(imdb_id: str) -> str:
         return m.group(1) if m else str(val)
     return "N/A"
 
-def _extract_from_jsonld(html: str) -> str:
-    m = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S|re.I)
-    if not m:
+# IMDb's public GraphQL endpoint — returns live ratings (not OMDb-cached values,
+# which lag by days on recent titles). No API key required; used internally by
+# imdb.com itself, so it's stable. Non-commercial use is permitted per IMDb's
+# data-usage policy (the response includes a disclaimer to that effect).
+# Replaces the previous HTML JSON-LD scrape, which stopped working when IMDb
+# put the site behind AWS WAF (requests get HTTP 202 + empty body without JS).
+_IMDB_GRAPHQL_URL = "https://caching.graphql.imdb.com/"
+_IMDB_RATING_QUERY = (
+    "query R($id: ID!) { title(id: $id) { "
+    "ratingsSummary { aggregateRating } } }"
+)
+
+def get_imdb_rating_from_graphql(imdb_id: str) -> str:
+    if not imdb_id:
         return "N/A"
     try:
-        block = m.group(1).strip()
-        data = json.loads(block)
-        def pick(d):
-            return (((d or {}).get("aggregateRating") or {}).get("ratingValue"))
-        if isinstance(data, list):
-            for d in data:
-                v = pick(d)
-                if v:
-                    mm = re.match(r"^(\d+(?:\.\d)?)", str(v))
-                    return mm.group(1) if mm else str(v)
-        else:
-            v = pick(data)
-            if v:
-                mm = re.match(r"^(\d+(?:\.\d)?)", str(v))
-                return mm.group(1) if mm else str(v)
-    except Exception as e:
-        log_err(f"JSON-LD parse failed: {e}")
-    return "N/A"
+        r = http().post(
+            _IMDB_GRAPHQL_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/graphql+json, application/json",
+            },
+            json={"query": _IMDB_RATING_QUERY, "variables": {"id": imdb_id}},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return "N/A"
+        data = (r.json() or {}).get("data") or {}
+        rs = ((data.get("title") or {}).get("ratingsSummary") or {})
+        val = rs.get("aggregateRating")
+        if val is None:
+            return "N/A"
+        return f"{float(val):.1f}"
+    except (requests.RequestException, ValueError, TypeError) as e:
+        log_err(f"IMDb GraphQL request failed: {_redact(e)}")
+        return "N/A"
 
 def _title_similarity(a, b):
     """Normalized-edit-distance similarity in [0, 1]."""
@@ -709,6 +731,11 @@ def get_mdl_rating(title: str, year=None):
     """
     Query kuryana (unofficial MDL API) and return (rating_str, 'MDL') or None.
     Requires a confident match: year must match OR title similarity >= 0.85.
+
+    Raises ProviderUnavailable if ALL kuryana mirrors fail with transient
+    errors (5xx, 429, timeout, network) — so the caller can keep the existing
+    rating instead of falling back to IMDb. Returns None when at least one
+    mirror responded but no confident match was found.
     """
     if not title:
         return None
@@ -717,9 +744,13 @@ def get_mdl_rating(title: str, year=None):
         return None
     query = quote(clean)
 
+    all_unavailable = True  # flips to False if any mirror responds (200 or 4xx)
     for base in KURYANA_BASE_URLS:
         try:
             r = http().get(f"{base}/search/q/{query}", timeout=15)
+            if r.status_code in (429, 500, 502, 503, 504):
+                continue  # try next mirror, keep all_unavailable=True
+            all_unavailable = False
             if r.status_code != 200:
                 continue
             data = r.json() or {}
@@ -760,10 +791,12 @@ def get_mdl_rating(title: str, year=None):
                 _mdl_url_cache[_provider_cache_key(title, year)] = f"https://mydramalist.com/{slug}"
 
             return (f"{val:.1f}", "MDL")
-        except Exception as e:
+        except (requests.RequestException, ValueError) as e:
             log_err(f"Kuryana lookup at {base} failed: {e}")
-            continue
+            continue  # keep all_unavailable=True so we raise at the end
 
+    if all_unavailable:
+        raise ProviderUnavailable("All kuryana mirrors unavailable")
     return None
 
 def _normalize_for_match(s):
@@ -787,6 +820,11 @@ def get_mal_rating(title, year=None):
     Query jikan (unofficial MAL API) and return (rating_str, 'MAL') or None.
     Matches against every known alternative title (English, Japanese, synonyms,
     titles[] array). Requires year match OR title similarity >= 0.85.
+
+    Raises ProviderUnavailable on transient errors (5xx, 429, timeout, network)
+    so the caller can preserve the existing rating instead of falling back to
+    IMDb. Returns None only when jikan responded successfully but no confident
+    match was found.
     """
     if not title:
         return None
@@ -799,6 +837,8 @@ def get_mal_rating(title, year=None):
         # ranking and returns arbitrary high-rated shows.
         params = {"q": clean, "limit": 10}
         r = http().get(f"{JIKAN_BASE_URL}/anime", params=params, timeout=15)
+        if r.status_code in (429, 500, 502, 503, 504):
+            raise ProviderUnavailable(f"Jikan returned {r.status_code}")
         if r.status_code != 200:
             return None
         data = r.json() or {}
@@ -851,9 +891,10 @@ def get_mal_rating(title, year=None):
             _mal_url_cache[_provider_cache_key(title, year)] = mal_url
 
         return (f"{val:.1f}", "MAL")
-    except Exception as e:
-        log_err(f"Jikan lookup failed: {e}")
-        return None
+    except ProviderUnavailable:
+        raise
+    except (requests.RequestException, ValueError) as e:
+        raise ProviderUnavailable(f"Jikan lookup failed: {e}") from e
 
 def get_rating_for_title(imdb_id, title, year=None, is_korean=False, is_anime=False):
     """
@@ -873,26 +914,31 @@ def get_rating_for_title(imdb_id, title, year=None, is_korean=False, is_anime=Fa
     return (r, "IMDb")
 
 def get_imdb_rating(imdb_id: str) -> str:
+    """Return current IMDb rating as a string, or 'N/A'.
+
+    Tries IMDb's GraphQL endpoint first (live ratings, no API key, no WAF
+    challenge) and falls back to OMDb only if GraphQL returns nothing. OMDb's
+    cached values can lag the live IMDb rating by 0–0.2 stars on recent
+    titles, so GraphQL is preferred when reachable.
+    """
     if not imdb_id:
         return "N/A"
-    rating = get_imdb_rating_from_omdb(imdb_id)
+    rating = get_imdb_rating_from_graphql(imdb_id)
     if rating != "N/A":
         return rating
-    # OMDb missed — fall back to scraping IMDb JSON-LD
-    try:
-        r = http().get(f"https://www.imdb.com/title/{quote(imdb_id)}/", timeout=15)
-        if r.status_code == 200:
-            return _extract_from_jsonld(r.text) or "N/A"
-    except requests.RequestException as e:
-        log_err(f"IMDb fetch failed: {e}")
-    return "N/A"
+    return get_imdb_rating_from_omdb(imdb_id)
 
 # ==========================
 # Rename Folder
 # ==========================
+_RATING_SUFFIX_RE = re.compile(r'\s+\[(?:IMDb|MDL|MAL|TMDb|RT)\s*\d+(?:\.\d+)?\]$')
+
 def _strip_rating_suffix(name: str) -> str:
     """Strip any rating suffix like [IMDb 7.2], [MDL 9.1], [MAL 8.4]."""
-    return re.sub(r'\s+\[(?:IMDb|MDL|MAL|TMDb|RT)\s*\d+(?:\.\d+)?\]$', '', name or '')
+    return _RATING_SUFFIX_RE.sub('', name or '')
+
+def _has_rating_suffix(name: str) -> bool:
+    return bool(_RATING_SUFFIX_RE.search(name or ''))
 
 def rename_folder(old_path, rating, source="IMDb"):
     old_path = os.path.normpath((old_path or '').rstrip(r'\/'))
@@ -1113,13 +1159,16 @@ def create_shortcuts(service, folder_path, imdb_id, tmdb_or_tvdb_id, title, is_k
                         except Exception: pass
 
                 # Single URL uses Twitter's OR operator to combine hashtag +
-                # exact-phrase search, filtered to Arabic.
+                # exact-phrase search, filtered to SEARCH_LANGUAGE. The OR
+                # clause is parenthesized so `lang:` applies to the whole
+                # alternation, not just the last term.
                 parts = []
                 if hashtag_tag:
                     parts.append(f"#{hashtag_tag}")
                 if clean_title:
                     parts.append(f'"{clean_title}"')
-                twitter_query = quote(" OR ".join(parts) + f" lang:{SEARCH_LANGUAGE}")
+                or_clause = f"({' OR '.join(parts)})" if len(parts) > 1 else parts[0]
+                twitter_query = quote(f"{or_clause} lang:{SEARCH_LANGUAGE}")
                 make_link("Twitter", f"https://twitter.com/search?q={twitter_query}")
         except Exception as e:
             log_err(f"Failed creating Twitter shortcut: {e}")
@@ -1451,8 +1500,12 @@ def _process(service, path):
     other_id = os.environ.get(cfg["other_id_env"])
     title    = os.environ.get(cfg["title_env"], "")
 
-    # Sweep mode: skip entirely if rating was checked recently
-    if RATING_ONLY and imdb and _rating_cache_is_fresh(imdb):
+    # Sweep mode: skip if rating was checked recently AND the folder still
+    # has a rating suffix. If the suffix is missing (no rating yet, or user
+    # stripped it manually), re-check regardless of cache age.
+    if (RATING_ONLY and imdb
+            and _has_rating_suffix(os.path.basename(path))
+            and _rating_cache_is_fresh(imdb)):
         log_debug(f"Cache fresh, skipping {title or path}")
         return
 
@@ -1478,7 +1531,16 @@ def _process(service, path):
             m = re.search(r'\((\d{4})\)\s*$', title or '')
             year = m.group(1) if m else ""
 
-        rating, source = get_rating_for_title(imdb, title, year, is_korean=is_korean, is_anime=is_anime)
+        try:
+            rating, source = get_rating_for_title(imdb, title, year, is_korean=is_korean, is_anime=is_anime)
+        except ProviderUnavailable as e:
+            # Provider (MAL/MDL) is having a transient outage. Keep the
+            # folder's existing rating — DON'T fall back to IMDb, which
+            # would silently rebrand an anime as IMDb and rename the folder.
+            log(f"Rating provider unavailable for {title or path}: {e}; keeping existing rating")
+            if RATING_ONLY:
+                return
+            rating, source = "N/A", "IMDb"  # skips rename + cache below
         target_suffix = f" [{source} {rating}]"
 
         if rating != "N/A" and ENABLE_RENAME_FOLDER and not os.path.basename(path).endswith(target_suffix):
@@ -1595,6 +1657,12 @@ def validate_config():
 
     probe("Sonarr", f"{SONARR_API_URL}/api/v3/system/status", {"X-Api-Key": SONARR_API_KEY})
     probe("Radarr", f"{RADARR_API_URL}/api/v3/system/status", {"X-Api-Key": RADARR_API_KEY})
+    # IMDb GraphQL — primary rating source. POST-only endpoint so the generic
+    # probe() helper can't cover it; call get_imdb_rating_from_graphql directly.
+    if get_imdb_rating_from_graphql("tt0111161") != "N/A":
+        ok("http  IMDb GraphQL reachable")
+    else:
+        fail("http  IMDb GraphQL unreachable or returned no rating")
     probe("OMDb",   f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&i=tt0111161")
     probe_any("Kuryana", [f"{u}/search/q/reverse" for u in KURYANA_BASE_URLS])
     probe("Jikan",  f"{JIKAN_BASE_URL}/anime?q=frieren&limit=1")
