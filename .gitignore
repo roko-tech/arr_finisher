@@ -11,6 +11,7 @@ __pycache__/
 # Logs + caches
 *.log
 .rating_cache.json
+arr_finisher_setup.txt
 
 # User scratch
 _scratch/

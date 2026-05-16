@@ -468,3 +468,140 @@ class TestOmdbCaching:
         assert f.get_imdb_rating_from_omdb("tt1234567") == "8.6"
         assert f.get_omdb_plot("tt1234567") == "A pithy summary."
         assert calls["n"] == 1   # cached
+
+
+# ---------- Version + CHANGELOG ----------
+
+class TestVersion:
+    def test_version_is_string(self):
+        assert isinstance(f.__version__, str)
+        # Sanity check it looks like semver (e.g., "1.0.0")
+        parts = f.__version__.split(".")
+        assert len(parts) >= 2
+        assert all(p.isdigit() for p in parts[:2])
+
+
+# ---------- ISO timestamps (back-compat: read float OR string) ----------
+
+class TestRatingCacheTimestamps:
+    def test_write_uses_iso_string(self, monkeypatch):
+        cache = {}
+        monkeypatch.setattr(f, "_rating_cache", cache)
+        f._rating_cache_set("tt100", "8.0", "IMDb")
+        # Stored as an ISO-8601 string (parseable by datetime.fromisoformat).
+        ts = cache["tt100"]["checked_at"]
+        assert isinstance(ts, str)
+        from datetime import datetime as _dt
+        _dt.fromisoformat(ts)   # raises if not parseable
+
+    def test_legacy_float_timestamp_still_reads_as_fresh(self, monkeypatch):
+        import time as _t
+        monkeypatch.setattr(f, "_rating_cache", {"tt200": {
+            "checked_at": _t.time(),   # legacy float epoch
+            "rating": "8.0", "source": "IMDb"
+        }})
+        assert f._rating_cache_is_fresh("tt200") is True
+
+    def test_iso_string_reads_as_fresh(self, monkeypatch):
+        from datetime import datetime as _dt
+        monkeypatch.setattr(f, "_rating_cache", {"tt300": {
+            "checked_at": _dt.now().isoformat(timespec="seconds"),
+            "rating": "8.0", "source": "IMDb"
+        }})
+        assert f._rating_cache_is_fresh("tt300") is True
+
+    def test_iso_string_old_reads_as_stale(self, monkeypatch):
+        # 100 days ago — past any reasonable TTL.
+        from datetime import datetime as _dt, timedelta
+        old = (_dt.now() - timedelta(days=100)).isoformat(timespec="seconds")
+        monkeypatch.setattr(f, "_rating_cache", {"tt400": {
+            "checked_at": old, "rating": "8.0", "source": "IMDb"
+        }})
+        assert f._rating_cache_is_fresh("tt400") is False
+
+    def test_garbage_timestamp_treated_as_stale(self, monkeypatch):
+        monkeypatch.setattr(f, "_rating_cache", {"tt500": {
+            "checked_at": "not-a-date", "rating": "8.0", "source": "IMDb"
+        }})
+        assert f._rating_cache_is_fresh("tt500") is False
+
+
+# ---------- Auto-discovery of sweep roots ----------
+
+class TestRootDiscovery:
+    def test_discover_returns_paths_from_both_services(self, monkeypatch):
+        def fake_http():
+            class _S:
+                @staticmethod
+                def get(url, headers=None, timeout=5):
+                    class _R:
+                        status_code = 200
+                        def json(self_):
+                            if "/movie" in url or "7878" in url or "radarr" in url.lower():
+                                return [{"path": r"E:\Movies"}]
+                            return [{"path": r"D:\TV Shows"}, {"path": r"D:\Anime"}]
+                    return _R()
+            return _S()
+        monkeypatch.setattr(f, "SONARR_API_KEY", "fakesonarr")
+        monkeypatch.setattr(f, "RADARR_API_KEY", "fakeradarr")
+        monkeypatch.setattr(f, "SONARR_API_URL", "http://localhost:8989")
+        monkeypatch.setattr(f, "RADARR_API_URL", "http://localhost:7878")
+        monkeypatch.setattr(f, "http", fake_http)
+        roots = f._discover_sweep_roots()
+        # Should have entries from both Sonarr and Radarr.
+        services = {svc for _, svc in roots}
+        assert "sonarr" in services
+        assert "radarr" in services
+
+    def test_discover_skips_unconfigured_service(self, monkeypatch):
+        monkeypatch.setattr(f, "SONARR_API_KEY", "")     # not configured
+        monkeypatch.setattr(f, "RADARR_API_KEY", "")     # not configured
+        roots = f._discover_sweep_roots()
+        assert roots == []
+
+    def test_discover_swallows_errors(self, monkeypatch):
+        def fake_http():
+            class _S:
+                @staticmethod
+                def get(url, headers=None, timeout=5):
+                    raise ConnectionError("nope")
+            return _S()
+        monkeypatch.setattr(f, "SONARR_API_KEY", "x")
+        monkeypatch.setattr(f, "RADARR_API_KEY", "x")
+        monkeypatch.setattr(f, "http", fake_http)
+        assert f._discover_sweep_roots() == []   # no crash
+
+
+# ---------- Setup-help sidecar ----------
+
+class TestSetupHelp:
+    def test_missing_omdb_writes_file(self, monkeypatch, tmp_path):
+        setup_path = tmp_path / "arr_finisher_setup.txt"
+        monkeypatch.setattr(f, "_SETUP_HELP_PATH", str(setup_path))
+        monkeypatch.setattr(f, "OMDB_API_KEY", "")
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", False)
+        missing = f._check_critical_config()
+        assert any(name == "OMDB_API_KEY" for name, _ in missing)
+        f._update_setup_help(missing)
+        assert setup_path.exists()
+        content = setup_path.read_text(encoding="utf-8")
+        assert "OMDB_API_KEY" in content
+
+    def test_healthy_config_clears_stale_file(self, monkeypatch, tmp_path):
+        setup_path = tmp_path / "arr_finisher_setup.txt"
+        setup_path.write_text("stale notice")
+        monkeypatch.setattr(f, "_SETUP_HELP_PATH", str(setup_path))
+        # No missing config — calling update with [] should delete the file.
+        f._update_setup_help([])
+        assert not setup_path.exists()
+
+    def test_sonarr_event_requires_sonarr_key(self, monkeypatch):
+        monkeypatch.setattr(f, "OMDB_API_KEY", "set")
+        monkeypatch.setattr(f, "SONARR_API_KEY", "")
+        monkeypatch.setattr(f, "RADARR_API_KEY", "set")
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", False)
+        # Sonarr webhook -> SONARR_API_KEY required, RADARR_API_KEY not.
+        missing = f._check_critical_config(sonarr_event="download")
+        names = [n for n, _ in missing]
+        assert "SONARR_API_KEY" in names
+        assert "RADARR_API_KEY" not in names
