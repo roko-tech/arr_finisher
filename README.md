@@ -31,7 +31,7 @@ Then in Sonarr/Radarr: **Settings → Connect → Custom Script**, point at
 |---|---|
 | **Folder icon from the show's poster** | Drives [maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator) — the original motivation for this project |
 | **Rating suffix in folder name** | `[IMDb 8.6]`, `[MDL 7.5]`, or `[MAL 9.3]` — picks the best source automatically (see below) |
-| **`Links/` subfolder with shortcuts** | IMDb, Parents Guide, TVTime, Letterboxd, MyDramaList, MyAnimeList, Twitter, combined Subtitle (SubDL + Subsource + OpenSubtitles) |
+| **`Links/` subfolder with shortcuts** | IMDb, TVTime, Letterboxd, MyDramaList, MyAnimeList, Twitter, combined Parents guide (IMDb + Common Sense Media + Does The Dog Die), combined Subtitle (SubDL + Subsource + OpenSubtitles) |
 | **Explorer tooltip** | OMDb plot summary + rating shown on hover, via `desktop.ini` `InfoTip` |
 | **Sonarr/Radarr path sync** | Folder rename is mirrored via API, with rollback on API failure. The rare double-failure case (rollback also fails) is appended to `.rollbacks.log` |
 
@@ -299,7 +299,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the version history.
 - **[jikan](https://jikan.moe)** — unofficial MyAnimeList API.
 - **[OMDb](https://www.omdbapi.com)** — ratings + plot summaries.
 - **[SubDL](https://subdl.com)** and **[OpenSubtitles](https://www.opensubtitles.com)** — direct subtitle URL resolution for the combined Subtitle shortcut.
-- Sites linked from the generated shortcuts: **[IMDb](https://www.imdb.com)**, **[Letterboxd](https://letterboxd.com)**, **[TVTime](https://www.tvtime.com)**, **[Subsource](https://subsource.net)**.
+- Sites linked from the generated shortcuts: **[IMDb](https://www.imdb.com)**, **[Letterboxd](https://letterboxd.com)**, **[TVTime](https://www.tvtime.com)**, **[Subsource](https://subsource.net)**, **[Common Sense Media](https://www.commonsensemedia.org)** and **[Does The Dog Die](https://www.doesthedogdie.com)** (Parents guide combo).
 
 ## License
 
