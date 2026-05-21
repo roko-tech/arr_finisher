@@ -1398,12 +1398,15 @@ def _language_from_env(prefix):
             return val.lower()
     return None
 
-def is_korean_radarr_movie(movie_id):
+def is_korean_radarr_movie(movie_id, force_api=False):
     """Return True if the Radarr movie's original language is Korean.
-    Tries env var first; falls back to Radarr API (cached per-run)."""
-    env_lang = _language_from_env("Radarr")
-    if env_lang is not None:
-        return "korean" in env_lang
+    Tries env var first; falls back to Radarr API (cached per-run).
+    Set force_api=True to skip the env-var short-circuit — used as a tiebreaker
+    when the folder name already says [MDL] but env vars disagree."""
+    if not force_api:
+        env_lang = _language_from_env("Radarr")
+        if env_lang is not None:
+            return "korean" in env_lang
     if not movie_id:
         return False
     cache_key = f"radarr:{movie_id}"
@@ -1425,12 +1428,15 @@ def is_korean_radarr_movie(movie_id):
     _korean_cache[cache_key] = result
     return result
 
-def is_korean_sonarr_series(series_id):
+def is_korean_sonarr_series(series_id, force_api=False):
     """Return True if the Sonarr series' original language is Korean.
-    Tries env var first; falls back to Sonarr API (cached per-run)."""
-    env_lang = _language_from_env("Sonarr")
-    if env_lang is not None:
-        return "korean" in env_lang
+    Tries env var first; falls back to Sonarr API (cached per-run).
+    Set force_api=True to skip the env-var short-circuit — used as a tiebreaker
+    when the folder name already says [MDL] but env vars disagree."""
+    if not force_api:
+        env_lang = _language_from_env("Sonarr")
+        if env_lang is not None:
+            return "korean" in env_lang
     if not series_id:
         return False
     cache_key = f"sonarr:{series_id}"
@@ -1452,19 +1458,22 @@ def is_korean_sonarr_series(series_id):
     _korean_cache[cache_key] = result
     return result
 
-def is_anime_sonarr_series(series_id, path=None):
+def is_anime_sonarr_series(series_id, path=None, force_api=False):
     """Return True if this is an anime. Checks, in order:
        1. Sonarr_Series_Type env var (== 'anime')
        2. Path contains an '\\anime\\' segment (case-insensitive, user convention)
        3. Sonarr API seriesType == 'anime'
+    Set force_api=True to skip the env-var and path-heuristic short-circuits —
+    used as a tiebreaker when the folder name says [MAL] but detection disagrees.
     """
-    # 1. Env var from Sonarr hook
-    stype = os.environ.get("Sonarr_Series_Type", "").strip().lower()
-    if stype:
-        return stype == "anime"
-    # 2. Path-based heuristic (case-insensitive; Windows paths usually are)
-    if path and (os.sep + "anime" + os.sep) in (path + os.sep).lower():
-        return True
+    if not force_api:
+        # 1. Env var from Sonarr hook
+        stype = os.environ.get("Sonarr_Series_Type", "").strip().lower()
+        if stype:
+            return stype == "anime"
+        # 2. Path-based heuristic (case-insensitive; Windows paths usually are)
+        if path and (os.sep + "anime" + os.sep) in (path + os.sep).lower():
+            return True
     # 3. API lookup with cache
     if not series_id:
         return False
@@ -1486,13 +1495,16 @@ def is_anime_sonarr_series(series_id, path=None):
     _anime_cache[cache_key] = result
     return result
 
-def is_anime_radarr_movie(movie_id, path=None):
+def is_anime_radarr_movie(movie_id, path=None, force_api=False):
     """Return True if this is an anime movie. Checks:
        1. Path contains an '\\anime\\' segment (case-insensitive)
        2. Radarr API: genres include 'Animation' AND originalLanguage == Japanese
+    Set force_api=True to skip the path-heuristic short-circuit — used as a
+    tiebreaker when the folder name says [MAL] but the path doesn't hint at anime.
     """
-    if path and (os.sep + "anime" + os.sep) in (path + os.sep).lower():
-        return True
+    if not force_api:
+        if path and (os.sep + "anime" + os.sep) in (path + os.sep).lower():
+            return True
     if not movie_id:
         return False
     cache_key = f"radarr:{movie_id}"
@@ -1553,8 +1565,8 @@ _SERVICE_ADAPTERS = {
         "other_id_env": "Sonarr_Series_TvdbId",
         "title_env":    "Sonarr_Series_Title",
         "year_env":     "Sonarr_Series_Year",
-        "is_anime":     lambda obj_id, p: is_anime_sonarr_series(obj_id, p),
-        "is_korean":    lambda obj_id: is_korean_sonarr_series(obj_id),
+        "is_anime":     lambda obj_id, p, force_api=False: is_anime_sonarr_series(obj_id, p, force_api=force_api),
+        "is_korean":    lambda obj_id, force_api=False: is_korean_sonarr_series(obj_id, force_api=force_api),
         "update_path":  lambda obj_id, np: sonarr_update_path_via_put(int(obj_id), np),
     },
     "radarr": {
@@ -1564,8 +1576,8 @@ _SERVICE_ADAPTERS = {
         "other_id_env": "Radarr_Movie_TmdbId",
         "title_env":    "Radarr_Movie_Title",
         "year_env":     "Radarr_Movie_Year",
-        "is_anime":     lambda obj_id, p: is_anime_radarr_movie(obj_id, p),
-        "is_korean":    lambda obj_id: is_korean_radarr_movie(obj_id),
+        "is_anime":     lambda obj_id, p, force_api=False: is_anime_radarr_movie(obj_id, p, force_api=force_api),
+        "is_korean":    lambda obj_id, force_api=False: is_korean_radarr_movie(obj_id, force_api=force_api),
         "update_path":  lambda obj_id, np: radarr_update_path_via_put(int(obj_id), np),
     },
 }
@@ -1607,6 +1619,26 @@ def _process(service, path):
         is_anime    = cfg["is_anime"](obj_id, path) if need_anime else False
         # Anime and Korean are mutually exclusive in practice; anime takes priority
         is_korean   = (not is_anime) and need_korean and cfg["is_korean"](obj_id)
+
+        # Tiebreaker: if the folder name already carries [MAL X.X] or [MDL X.X]
+        # but our env-var-fast-path detection said otherwise, consult the
+        # service API directly. Sonarr/Radarr occasionally send stale language
+        # env vars mid-metadata-refresh — without this guard, a Korean drama
+        # gets silently demoted from MDL to IMDb just because Sonarr's webhook
+        # passed an outdated value. We only check the API when there's prior
+        # evidence (the existing suffix) that demotion would be wrong.
+        basename = os.path.basename(path)
+        if not is_anime and need_anime and " [MAL " in basename:
+            if cfg["is_anime"](obj_id, path, force_api=True):
+                log_warn(f"Detection said non-anime for {title or path!r} but folder is [MAL ...] "
+                         "and service API confirms anime — preserving anime classification")
+                is_anime = True
+                is_korean = False  # anime takes priority
+        if not is_korean and not is_anime and need_korean and " [MDL " in basename:
+            if cfg["is_korean"](obj_id, force_api=True):
+                log_warn(f"Detection said non-Korean for {title or path!r} but folder is [MDL ...] "
+                         "and service API confirms Korean — preserving Korean classification")
+                is_korean = True
 
         # Year from service env var (preferred) or parse from title
         year = os.environ.get(cfg["year_env"]) or ""

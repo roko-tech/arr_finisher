@@ -245,6 +245,94 @@ class TestSonarrProcess:
         assert os.path.isdir(os.path.join(staging, "Reverse (2026) [MDL 7.5]"))
 
 
+# ---------- Env-vs-API tiebreaker (no silent MDL/MAL → IMDb demotion) ----------
+
+class TestEnvVsApiTiebreaker:
+    """Regression: when Sonarr/Radarr sends a stale OriginalLanguage env var
+    (mid-metadata-refresh), the fast env-var path used to silently demote a
+    [MDL X.X] folder to [IMDb Y.Y]. The fix consults the service API as a
+    tiebreaker when the existing folder suffix contradicts the env-var
+    detection — same idea for [MAL X.X] and anime."""
+
+    def test_mdl_suffix_preserved_when_api_says_korean(self, staging, make_series, patch_providers, clear_env_vars):
+        # Folder is already labeled [MDL 7.7]; env var lies (says English),
+        # API tells the truth (Korean). Defensive check must consult API
+        # and keep the show on MDL — NOT demote to IMDb.
+        folder = make_series("Gold Land (2026) [MDL 7.7]")
+        patch_providers["mdl_rating"]      = ("7.6", "MDL")
+        patch_providers["imdb_rating"]     = "7.7"      # would be the wrong demotion target
+        patch_providers["api_says_korean"] = True       # ← API tiebreaker says Korean
+        os.environ.update({
+            "Sonarr_Series_Id": "1", "Sonarr_Series_ImdbId": "tt1",
+            "Sonarr_Series_Title": "Gold Land (2026)", "Sonarr_Series_Year": "2026",
+            "Sonarr_OriginalLanguage": "English",       # ← stale, wrong env var
+        })
+        f.process_sonarr(folder)
+        assert not os.path.isdir(folder)                            # renamed
+        assert os.path.isdir(os.path.join(staging, "Gold Land (2026) [MDL 7.6]"))
+        assert not os.path.isdir(os.path.join(staging, "Gold Land (2026) [IMDb 7.7]"))
+
+    def test_mal_suffix_preserved_when_api_says_anime(self, staging, make_series, patch_providers, clear_env_vars):
+        folder = make_series("Frieren (2023) [MAL 9.3]")
+        patch_providers["mal_rating"]     = ("9.2", "MAL")
+        patch_providers["imdb_rating"]    = "8.5"
+        patch_providers["api_says_anime"] = True        # ← API tiebreaker says anime
+        os.environ.update({
+            "Sonarr_Series_Id": "2", "Sonarr_Series_ImdbId": "tt2",
+            "Sonarr_Series_Title": "Frieren (2023)", "Sonarr_Series_Year": "2023",
+            "Sonarr_Series_Type": "standard",           # ← stale, wrong env var
+        })
+        f.process_sonarr(folder)
+        assert not os.path.isdir(folder)
+        assert os.path.isdir(os.path.join(staging, "Frieren (2023) [MAL 9.2]"))
+        assert not os.path.isdir(os.path.join(staging, "Frieren (2023) [IMDb 8.5]"))
+
+    def test_tiebreaker_does_not_fire_without_prior_suffix(self, staging, make_series, patch_providers, clear_env_vars, monkeypatch):
+        # No [MDL]/[MAL] suffix yet: the tiebreaker has no prior evidence to
+        # disagree with, so it must NOT fire (would be a wasted API call).
+        # We assert this by tracking whether force_api=True was ever used.
+        folder = make_series("Some Show (2024)")
+        force_api_calls = {"n": 0}
+        orig_is_korean = f.is_korean_sonarr_series
+        orig_is_anime  = f.is_anime_sonarr_series
+        def spy_is_korean(series_id, force_api=False):
+            if force_api: force_api_calls["n"] += 1
+            return orig_is_korean(series_id, force_api=force_api)
+        def spy_is_anime(series_id, path=None, force_api=False):
+            if force_api: force_api_calls["n"] += 1
+            return orig_is_anime(series_id, path=path, force_api=force_api)
+        monkeypatch.setattr(f, "is_korean_sonarr_series", spy_is_korean)
+        monkeypatch.setattr(f, "is_anime_sonarr_series",  spy_is_anime)
+        patch_providers["imdb_rating"] = "8.0"
+        os.environ.update({
+            "Sonarr_Series_Id": "3", "Sonarr_Series_ImdbId": "tt3",
+            "Sonarr_Series_Title": "Some Show (2024)", "Sonarr_Series_Year": "2024",
+            "Sonarr_OriginalLanguage": "English",
+        })
+        f.process_sonarr(folder)
+        assert force_api_calls["n"] == 0, (
+            f"Tiebreaker called force_api={force_api_calls['n']} times on a "
+            "folder with no prior MDL/MAL suffix — should not have fired."
+        )
+        assert os.path.isdir(os.path.join(staging, "Some Show (2024) [IMDb 8.0]"))
+
+    def test_tiebreaker_respects_api_disagreement(self, staging, make_series, patch_providers, clear_env_vars):
+        # Folder is [MDL 7.0] but API also says non-Korean (e.g. user re-tagged
+        # the show in Sonarr). The tiebreaker should NOT override — the
+        # demotion to IMDb is intentional.
+        folder = make_series("Mislabeled (2024) [MDL 7.0]")
+        patch_providers["imdb_rating"]     = "6.5"
+        patch_providers["api_says_korean"] = False      # ← API agrees: NOT Korean
+        os.environ.update({
+            "Sonarr_Series_Id": "4", "Sonarr_Series_ImdbId": "tt4",
+            "Sonarr_Series_Title": "Mislabeled (2024)", "Sonarr_Series_Year": "2024",
+            "Sonarr_OriginalLanguage": "English",
+        })
+        f.process_sonarr(folder)
+        # Folder was correctly re-rated as IMDb.
+        assert os.path.isdir(os.path.join(staging, "Mislabeled (2024) [IMDb 6.5]"))
+
+
 # ---------- Direct-link shortcuts (MDL + MAL use show page, not search) ----------
 
 class TestDirectLinks:

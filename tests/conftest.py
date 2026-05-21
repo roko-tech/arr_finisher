@@ -58,15 +58,28 @@ def patch_providers(monkeypatch):
 
     # Also stub out anime/korean detection so tests never reach real Sonarr/Radarr APIs.
     # Detection falls through to env vars that the test sets; no API call is made.
-    def fake_is_korean_sonarr(series_id):
+    # The `force_api` kwarg mirrors the real signature; tests can simulate a
+    # "stale env var, API disagrees" scenario by setting patches["api_says_korean"]
+    # / patches["api_says_anime"] which only take effect when force_api=True.
+    patches.setdefault("api_says_korean", False)
+    patches.setdefault("api_says_anime",  False)
+    def fake_is_korean_sonarr(series_id, force_api=False):
+        if force_api:
+            return patches["api_says_korean"]
         return "korean" in os.environ.get("Sonarr_OriginalLanguage", "").lower()
-    def fake_is_korean_radarr(movie_id):
+    def fake_is_korean_radarr(movie_id, force_api=False):
+        if force_api:
+            return patches["api_says_korean"]
         return "korean" in os.environ.get("Radarr_Movie_OriginalLanguage", "").lower()
-    def fake_is_anime_sonarr(series_id, path=None):
+    def fake_is_anime_sonarr(series_id, path=None, force_api=False):
+        if force_api:
+            return patches["api_says_anime"]
         if os.environ.get("Sonarr_Series_Type", "").lower() == "anime":
             return True
         return bool(path and os.sep + "Anime" + os.sep in path + os.sep)
-    def fake_is_anime_radarr(movie_id, path=None):
+    def fake_is_anime_radarr(movie_id, path=None, force_api=False):
+        if force_api:
+            return patches["api_says_anime"]
         return bool(path and os.sep + "Anime" + os.sep in path + os.sep)
     monkeypatch.setattr(f, "is_korean_sonarr_series", fake_is_korean_sonarr)
     monkeypatch.setattr(f, "is_korean_radarr_movie",  fake_is_korean_radarr)
