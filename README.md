@@ -217,6 +217,7 @@ python arr_finisher.py --sweep --force-refresh                     # bypass the 
 python arr_finisher.py --sweep --dry-run                           # preview without touching anything
 python arr_finisher.py --regenerate-shortcuts                      # rebuild every Links/ shortcut with current code
 python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"   # single folder (looks up env from Sonarr/Radarr)
+python arr_finisher.py --service radarr --path "E:\Movies\Foo" --force   # also rewrite icon/shortcuts/tooltip even if up to date
 python arr_finisher.py --clear-cache                               # wipe .rating_cache.json
 python arr_finisher.py --refresh tt7160070                         # invalidate one IMDb ID so next sweep re-fetches
 python arr_finisher.py --version                                   # print version and exit
@@ -254,7 +255,7 @@ Resolved in this order, first hit wins:
 1. `--roots "D:\Shows:sonarr" "F:\Movies:radarr"` on the CLI (the service is matched on the last colon, so Windows drive letters in the path are fine)
 2. `ARR_FINISHER_SWEEP_ROOTS` env var — pipe-separated `path:service` pairs
 3. **Auto-discovery** — Sonarr `/api/v3/rootfolder` and Radarr `/api/v3/rootfolder` are queried; their configured root folders become the sweep roots
-4. Hardcoded fallback (`D:\TV Shows`, `D:\Anime`, `E:\Movies`) — only used when no service is reachable
+4. If none of the above yield anything, the sweep refuses to run and tells you to configure roots (no hardcoded fallback paths — those were removed in 1.0.0)
 
 Auto-discovery means you usually don't need to configure roots at all if your
 Sonarr / Radarr instances are healthy when the sweep runs.

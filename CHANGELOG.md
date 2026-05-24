@@ -2,6 +2,45 @@
 
 All notable changes to arr_finisher are listed here. Versions follow [SemVer](https://semver.org).
 
+## Unreleased
+
+### Added
+- `--force` flag for manual mode (`--service` + `--path`): rewrite folder icon,
+  shortcuts, and tooltip even when they're already up to date. Bypasses the
+  idempotency skips that otherwise make a re-run of an unchanged folder a no-op.
+  Single-folder only; rejected with `--sweep` or `--regenerate-shortcuts`.
+  Under the hood: wipes `folder.ico` + `desktop.ini` before calling
+  `Creator.exe -r` (busts Windows' per-path icon cache) and forces every
+  `Links/*.lnk` and the tooltip to be rewritten.
+- `_apply_content_class_tiebreaker` helper, used by both `_process` and
+  `regenerate_shortcuts` so the env-vs-API tiebreaker logic doesn't drift
+  between the two call sites.
+
+### Fixed
+- `--regenerate-shortcuts --dry-run` and `--force --dry-run` no longer delete
+  existing `.lnk` / `.vbs` files in `Links/`, and no longer create an empty
+  `Links/` directory. The wipe paths in `_write_lnk` and `create_shortcuts`
+  now check `DRY_RUN` before mutating disk.
+- `get_mdl_rating` now raises `ProviderUnavailable` when a kuryana mirror
+  returns HTTP 200 with malformed JSON (previously masked the outage by
+  returning `None`, causing a Korean drama to be re-rated as IMDb — the same
+  failure mode the `ProviderUnavailable` contract was added to prevent in 1.0).
+- `regenerate_shortcuts` now applies the `[MAL ...]` / `[MDL ...]` env-vs-API
+  tiebreaker. A folder whose Sonarr `seriesType` env var went stale used to
+  silently lose its MyAnimeList/MyDramaList shortcut on regen.
+- `--force` now preserves any existing folder tooltip across the `desktop.ini`
+  wipe — restored as a fallback after `Creator.exe` writes a fresh
+  `desktop.ini`. If OMDb later returns a plot, the regular tooltip path
+  overwrites it; if OMDb has nothing, the user's previous tooltip survives.
+- README's "Sweep roots" section no longer claims a hardcoded
+  `D:\TV Shows / D:\Anime / E:\Movies` fallback (the fallback was removed in
+  1.0.0 but the doc was stale).
+
+### Changed
+- `_fs_lock` docstring and contention warning corrected: the helper yields
+  `acquired=False` for the caller to decide; the only current caller
+  (`_process`) skips. Previous wording claimed "proceeding".
+
 ## [1.0.0] — 2026-05-16
 
 First versioned release. Marks the post-review baseline: all known critical

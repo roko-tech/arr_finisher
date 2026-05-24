@@ -83,6 +83,7 @@ ENABLE_GROUPED_LINKS_FOLDER = True
 ENABLE_MDL_RATING           = True   # For Korean titles: use MDL rating (falls back to IMDb)
 ENABLE_MAL_RATING           = True   # For anime: use MAL rating (falls back to IMDb)
 FORCE_REGENERATE_SHORTCUTS  = False  # When True, delete + recreate all shortcuts on every run
+FORCE_REBUILD               = False  # When True, rewrite icon/shortcuts/tooltip even if already up-to-date
 DRY_RUN                     = False  # When True, log intended actions but don't touch disk/APIs
 RATING_ONLY                 = False  # Sweep mode: refresh rating only, skip icon/shortcuts/tooltip
 
@@ -198,8 +199,10 @@ _FS_LOCK_STALE_SECS = 600  # 10 minutes — a real run never approaches this
 @contextmanager
 def _fs_lock(key: str, retries: int = 6, wait_s: float = 0.5):
     """Best-effort cross-process lock. Retries on contention; reclaims locks
-    older than _FS_LOCK_STALE_SECS (presumed crashed). If still unavailable,
-    logs a warning and proceeds — better than blocking a webhook forever."""
+    older than _FS_LOCK_STALE_SECS (presumed crashed). If still unavailable
+    after retries, yields acquired=False so the caller can decide whether to
+    skip or proceed — the only current caller (_process) skips, to avoid
+    racing with the holder of the lock."""
     base = os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", key or "lock")
     path = os.path.join(base, f"arr_finisher_lock_{safe}")
@@ -222,7 +225,7 @@ def _fs_lock(key: str, retries: int = 6, wait_s: float = 0.5):
         except Exception:
             break
     if not acquired:
-        log_warn(f"Could not acquire lock {key!r} after {retries} attempts; proceeding")
+        log_warn(f"Could not acquire lock {key!r} after {retries} attempts")
     try:
         yield acquired
     finally:
@@ -540,7 +543,7 @@ def set_folder_tooltip(folder_path: str, tooltip: str) -> None:
         elif in_shell and stripped.lower().startswith("infotip="):
             existing_tip = stripped[len("infotip="):]
             break
-    if existing_tip == tooltip:
+    if existing_tip == tooltip and not FORCE_REBUILD:
         log_debug(f"Tooltip unchanged on {os.path.basename(folder_path)}")
         return
 
@@ -757,16 +760,17 @@ def get_mdl_rating(title: str, year=None):
         return None
     query = quote(clean)
 
-    all_unavailable = True  # flips to False if any mirror responds (200 or 4xx)
+    all_unavailable = True  # flips to False only on a successfully-parsed response
     for base in KURYANA_BASE_URLS:
         try:
             r = http().get(f"{base}/search/q/{query}", timeout=15)
             if r.status_code in (429, 500, 502, 503, 504):
                 continue  # try next mirror, keep all_unavailable=True
-            all_unavailable = False
             if r.status_code != 200:
+                all_unavailable = False  # non-200 non-transient: kuryana is responsive
                 continue
-            data = r.json() or {}
+            data = r.json() or {}  # malformed JSON raises ValueError → caught below
+            all_unavailable = False  # successful parse: mirror is responsive
             dramas = (data.get("results") or {}).get("dramas") or []
             if not dramas:
                 continue
@@ -1082,19 +1086,85 @@ def _desktop_ini_has_icon(folder_path):
         return False
     return False
 
+def _read_desktop_ini_infotip(folder_path):
+    """Return the InfoTip= value under [.ShellClassInfo] in desktop.ini, or
+    None if absent / unreadable. Used to preserve a user's existing tooltip
+    across a --force wipe when OMDb would otherwise leave it empty."""
+    ini = os.path.join(folder_path, "desktop.ini")
+    if not os.path.isfile(ini):
+        return None
+    try:
+        with open(ini, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    for enc in ("utf-16", "utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        in_shell = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_shell = stripped.lower() == "[.shellclassinfo]"
+            elif in_shell and stripped.lower().startswith("infotip="):
+                return stripped[len("infotip="):]
+        return None
+    return None
+
+def _wipe_icon_state(path):
+    """Delete folder.ico + desktop.ini so the next Creator.exe run starts fresh
+    and Windows drops its cached icon for this folder. Keeps folder.jpg
+    (Creator.exe uses it as the source poster). Best-effort: file-attribute
+    flags are cleared first to allow deletion, and missing files are ignored.
+    Returns the existing InfoTip value (if any) so the caller can restore it
+    after Creator.exe rewrites desktop.ini from scratch."""
+    preserved_tip = _read_desktop_ini_infotip(path)
+    for fname in ("folder.ico", "desktop.ini"):
+        target = os.path.join(path, fname)
+        _set_file_attrs(target, remove=(_FILE_ATTRIBUTE_READONLY
+                                         | _FILE_ATTRIBUTE_HIDDEN
+                                         | _FILE_ATTRIBUTE_SYSTEM))
+        try:
+            os.remove(target)
+            log_debug(f"Wiped {fname} before regeneration")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log_warn(f"Could not wipe {fname}: {e}")
+    # Folder itself: drop READONLY/SYSTEM so subsequent writes work cleanly.
+    _set_file_attrs(path, remove=(_FILE_ATTRIBUTE_READONLY | _FILE_ATTRIBUTE_SYSTEM))
+    return preserved_tip
+
 def create_folder_icon(path):
     if not ENABLE_CREATE_FOLDER_ICON:
         return
     try:
-        if _desktop_ini_has_icon(path):
+        if _desktop_ini_has_icon(path) and not FORCE_REBUILD:
             log_debug("Folder icon already set; skipping")
             return
         if DRY_RUN:
             log(f"[DRY RUN] Would run FolderIconCreator on {path}")
             return
-        subprocess.run([FOLDER_ICON_EXE, "-h", "-f", path], check=False)
+        # Under --force, wipe folder.ico + desktop.ini first. The wipe is
+        # what actually breaks Windows' folder-icon cache — Explorer keys its
+        # cache off the file's path, so deleting and recreating reads fresh.
+        # Still pass -r as belt-and-suspenders in case some attribute survives.
+        preserved_tip = None
+        force_args = []
+        if FORCE_REBUILD:
+            preserved_tip = _wipe_icon_state(path)
+            force_args = ["-r"]
+        subprocess.run([FOLDER_ICON_EXE, "-h", *force_args, "-f", path], check=False)
         _set_file_attrs(path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_READONLY))
         log("FolderIconCreator OK")
+        # Restore any pre-wipe InfoTip. Creator.exe rewrites desktop.ini from
+        # scratch, so without this the user's tooltip is lost whenever OMDb
+        # has no plot for the title (later set_folder_tooltip call would be
+        # skipped). If OMDb DOES return a plot, the later call overwrites.
+        if preserved_tip:
+            set_folder_tooltip(path, preserved_tip)
     except Exception as e:
         log_err(f"FolderIconCreator failed: {e}")
 
@@ -1103,7 +1173,10 @@ def create_folder_icon(path):
 # ==========================
 def _write_lnk(path, target, name):
     if os.path.exists(path):
-        if FORCE_REGENERATE_SHORTCUTS:
+        if FORCE_REGENERATE_SHORTCUTS or FORCE_REBUILD:
+            if DRY_RUN:
+                log(f"[DRY RUN] Would regenerate shortcut: {os.path.basename(path)}")
+                return
             try:
                 os.remove(path)
                 log(f"Regenerating: {os.path.basename(path)}")
@@ -1162,22 +1235,27 @@ def create_shortcuts(service, folder_path, imdb_id, tmdb_or_tvdb_id, title, is_k
     links_dir = folder_path
     if ENABLE_GROUPED_LINKS_FOLDER:
         links_dir = os.path.join(folder_path, "Links")
-        try:
-            os.makedirs(links_dir, exist_ok=True)
-        except Exception as e:
-            log_err(f"Could not create Links folder: {e}")
-            links_dir = folder_path
+        if not DRY_RUN:
+            try:
+                os.makedirs(links_dir, exist_ok=True)
+            except Exception as e:
+                log_err(f"Could not create Links folder: {e}")
+                links_dir = folder_path
 
     # Force-regenerate: wipe existing .lnk and .vbs files so they're rebuilt
     # with current URL formats, icons, etc.
-    if FORCE_REGENERATE_SHORTCUTS and os.path.isdir(links_dir):
-        for fname in os.listdir(links_dir):
-            if fname.lower().endswith(('.lnk', '.vbs')):
+    if (FORCE_REGENERATE_SHORTCUTS or FORCE_REBUILD) and os.path.isdir(links_dir):
+        wipeable = [fname for fname in os.listdir(links_dir)
+                    if fname.lower().endswith(('.lnk', '.vbs'))]
+        if DRY_RUN:
+            log(f"[DRY RUN] Would wipe {len(wipeable)} existing shortcut(s) in Links/")
+        else:
+            for fname in wipeable:
                 try:
                     os.remove(os.path.join(links_dir, fname))
                 except Exception as e:
                     log_err(f"Could not remove {fname} for regeneration: {e}")
-        log("Regenerating all shortcuts in Links folder")
+            log("Regenerating all shortcuts in Links folder")
 
     def make_link(name, url_or_path):
         _write_lnk(os.path.join(links_dir, f"{name}.lnk"), url_or_path, name)
@@ -1582,6 +1660,31 @@ _SERVICE_ADAPTERS = {
     },
 }
 
+def _apply_content_class_tiebreaker(service, obj_id, path, is_anime, is_korean,
+                                     need_anime, need_korean):
+    """When the folder name already carries [MAL X.X] / [MDL X.X] but env-var
+    detection said otherwise, consult the service API directly. Sonarr/Radarr
+    occasionally send stale language env vars mid-metadata-refresh; without
+    this guard, a Korean drama or anime gets silently demoted just because
+    the webhook passed an outdated value. Only checked when there's prior
+    evidence (the existing suffix) that demotion would be wrong, so it costs
+    no extra API call on first-time imports.
+    Returns possibly-updated (is_anime, is_korean)."""
+    cfg = _SERVICE_ADAPTERS[service]
+    basename = os.path.basename(path)
+    if not is_anime and need_anime and " [MAL " in basename:
+        if cfg["is_anime"](obj_id, path, force_api=True):
+            log_warn(f"Detection said non-anime for {basename!r} but folder is [MAL ...] "
+                     "and service API confirms anime — preserving anime classification")
+            is_anime = True
+            is_korean = False  # anime takes priority
+    if not is_korean and not is_anime and need_korean and " [MDL " in basename:
+        if cfg["is_korean"](obj_id, force_api=True):
+            log_warn(f"Detection said non-Korean for {basename!r} but folder is [MDL ...] "
+                     "and service API confirms Korean — preserving Korean classification")
+            is_korean = True
+    return is_anime, is_korean
+
 def _process(service, path):
     """Shared post-import flow for Sonarr/Radarr."""
     cfg = _SERVICE_ADAPTERS[service]
@@ -1619,26 +1722,8 @@ def _process(service, path):
         is_anime    = cfg["is_anime"](obj_id, path) if need_anime else False
         # Anime and Korean are mutually exclusive in practice; anime takes priority
         is_korean   = (not is_anime) and need_korean and cfg["is_korean"](obj_id)
-
-        # Tiebreaker: if the folder name already carries [MAL X.X] or [MDL X.X]
-        # but our env-var-fast-path detection said otherwise, consult the
-        # service API directly. Sonarr/Radarr occasionally send stale language
-        # env vars mid-metadata-refresh — without this guard, a Korean drama
-        # gets silently demoted from MDL to IMDb just because Sonarr's webhook
-        # passed an outdated value. We only check the API when there's prior
-        # evidence (the existing suffix) that demotion would be wrong.
-        basename = os.path.basename(path)
-        if not is_anime and need_anime and " [MAL " in basename:
-            if cfg["is_anime"](obj_id, path, force_api=True):
-                log_warn(f"Detection said non-anime for {title or path!r} but folder is [MAL ...] "
-                         "and service API confirms anime — preserving anime classification")
-                is_anime = True
-                is_korean = False  # anime takes priority
-        if not is_korean and not is_anime and need_korean and " [MDL " in basename:
-            if cfg["is_korean"](obj_id, force_api=True):
-                log_warn(f"Detection said non-Korean for {title or path!r} but folder is [MDL ...] "
-                         "and service API confirms Korean — preserving Korean classification")
-                is_korean = True
+        is_anime, is_korean = _apply_content_class_tiebreaker(
+            service, obj_id, path, is_anime, is_korean, need_anime, need_korean)
 
         # Year from service env var (preferred) or parse from title
         year = os.environ.get(cfg["year_env"]) or ""
@@ -2063,22 +2148,24 @@ def regenerate_shortcuts(roots=None):
                     title = obj.get("title") or ""
                     year = str(obj.get("year") or "")
                     imdb_id = obj.get("imdbId") or ""
+                    need_anime  = ENABLE_MAL_RATING or ENABLE_SHORTCUT_MYANIMELIST
+                    need_korean = ENABLE_MDL_RATING or ENABLE_SHORTCUT_MYDRAMALIST
                     if service == "sonarr":
                         sid = obj.get("id")
                         tvdb_id = obj.get("tvdbId") or ""
-                        is_anime = is_anime_sonarr_series(sid, sub) if (
-                            ENABLE_MAL_RATING or ENABLE_SHORTCUT_MYANIMELIST) else False
-                        is_korean = (not is_anime) and is_korean_sonarr_series(sid) if (
-                            ENABLE_MDL_RATING or ENABLE_SHORTCUT_MYDRAMALIST) else False
+                        is_anime  = is_anime_sonarr_series(sid, sub) if need_anime else False
+                        is_korean = (not is_anime) and is_korean_sonarr_series(sid) if need_korean else False
+                        is_anime, is_korean = _apply_content_class_tiebreaker(
+                            "sonarr", sid, sub, is_anime, is_korean, need_anime, need_korean)
                         create_shortcuts("sonarr", sub, imdb_id, tvdb_id, title,
                                          is_korean=is_korean, is_anime=is_anime, year=year)
                     else:
                         mid = obj.get("id")
                         tmdb_id = obj.get("tmdbId") or ""
-                        is_anime = is_anime_radarr_movie(mid, sub) if (
-                            ENABLE_MAL_RATING or ENABLE_SHORTCUT_MYANIMELIST) else False
-                        is_korean = (not is_anime) and is_korean_radarr_movie(mid) if (
-                            ENABLE_MDL_RATING or ENABLE_SHORTCUT_MYDRAMALIST) else False
+                        is_anime  = is_anime_radarr_movie(mid, sub) if need_anime else False
+                        is_korean = (not is_anime) and is_korean_radarr_movie(mid) if need_korean else False
+                        is_anime, is_korean = _apply_content_class_tiebreaker(
+                            "radarr", mid, sub, is_anime, is_korean, need_anime, need_korean)
                         create_shortcuts("radarr", sub, imdb_id, tmdb_id, title,
                                          is_korean=is_korean, is_anime=is_anime, year=year)
                     processed += 1
@@ -2191,6 +2278,11 @@ def main():
     parser.add_argument("--service", choices=["sonarr", "radarr"],
                         help="Manual mode: service to use with --path.")
     parser.add_argument("--path", help="Manual mode: folder to process.")
+    parser.add_argument("--force", action="store_true",
+                        help="With --service/--path: rewrite folder icon, shortcuts, "
+                             "and tooltip even if they're already up to date. "
+                             "Single-folder only — not compatible with --sweep or "
+                             "--regenerate-shortcuts.")
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete the rating-freshness cache and exit.")
     parser.add_argument("--refresh", metavar="IMDB_ID",
@@ -2208,10 +2300,20 @@ def main():
     if bool(args.service) != bool(args.path):
         parser.error("--service and --path must be used together")
 
-    global DRY_RUN
+    # --force is single-folder only — sweep / regen modes ignore it
+    if args.force:
+        if not (args.service and args.path):
+            parser.error("--force requires --service and --path (single-folder mode only)")
+        if args.sweep or args.regenerate_shortcuts:
+            parser.error("--force is not compatible with --sweep or --regenerate-shortcuts")
+
+    global DRY_RUN, FORCE_REBUILD
     DRY_RUN = args.dry_run
+    FORCE_REBUILD = args.force
     if DRY_RUN:
         log("DRY RUN mode — no disk or API mutations will occur")
+    if FORCE_REBUILD:
+        log("--force: will rewrite folder icon, shortcuts, and tooltip even if up to date")
 
     if args.clear_cache:
         return clear_rating_cache()

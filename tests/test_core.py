@@ -956,6 +956,154 @@ class TestFolderIconSkip:
         assert called["n"] == 0   # short-circuited
 
 
+# ---------- --force / FORCE_REBUILD: bypass idempotency skips ----------
+
+class TestForceRebuild:
+    def test_icon_skip_bypassed_when_forced(self, tmp_path, monkeypatch):
+        # An IconResource line normally short-circuits create_folder_icon.
+        # With FORCE_REBUILD=True, Creator.exe must run and be told -r so the
+        # external binary recreates the icon instead of skipping it.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "desktop.ini").write_bytes(
+            "[.ShellClassInfo]\r\nIconResource=poster.ico,0\r\n".encode("utf-16")
+        )
+        invocations = []
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: invocations.append(a[0]))
+        f.create_folder_icon(str(folder))
+        assert len(invocations) == 1
+        assert "-r" in invocations[0]
+
+    def test_icon_wipes_existing_files_when_forced(self, tmp_path, monkeypatch):
+        # --force must delete folder.ico + desktop.ini BEFORE Creator.exe runs,
+        # so Windows drops its cached icon for this folder path.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        ico = folder / "folder.ico"
+        ini = folder / "desktop.ini"
+        jpg = folder / "folder.jpg"
+        ico.write_bytes(b"old-icon-bytes")
+        ini.write_bytes("[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16"))
+        jpg.write_bytes(b"poster-source")   # must be preserved (Creator.exe needs it)
+
+        present_at_subprocess = {}
+        def fake_run(args, **kw):
+            # Snapshot which files exist when Creator.exe is invoked
+            present_at_subprocess["ico"] = ico.exists()
+            present_at_subprocess["ini"] = ini.exists()
+            present_at_subprocess["jpg"] = jpg.exists()
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        monkeypatch.setattr(f.subprocess, "run", fake_run)
+        f.create_folder_icon(str(folder))
+        assert present_at_subprocess["ico"] is False, "folder.ico must be deleted before Creator.exe runs"
+        assert present_at_subprocess["ini"] is False, "desktop.ini must be deleted before Creator.exe runs"
+        assert present_at_subprocess["jpg"] is True,  "folder.jpg must be preserved (Creator.exe poster source)"
+
+    def test_icon_does_not_wipe_without_force(self, tmp_path, monkeypatch):
+        # Without --force, the wipe must NOT happen — webhook + sweep behavior
+        # depends on Creator.exe's own idempotency.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        # No existing desktop.ini → create_folder_icon proceeds past the skip,
+        # but should not pre-delete anything else.
+        ico = folder / "folder.ico"
+        ico.write_bytes(b"do-not-delete-me")
+        present = {}
+        def fake_run(args, **kw):
+            present["ico"] = ico.exists()
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f, "FORCE_REBUILD", False)
+        monkeypatch.setattr(f.subprocess, "run", fake_run)
+        f.create_folder_icon(str(folder))
+        assert present["ico"] is True, "folder.ico must NOT be wiped when --force is off"
+
+    def test_icon_no_dash_r_without_force(self, tmp_path, monkeypatch):
+        # Without --force, the -r flag must NOT be added (so we don't disrupt
+        # webhook / sweep behavior that relies on Creator.exe's own idempotency).
+        folder = tmp_path / "show"
+        folder.mkdir()
+        # No desktop.ini at all → create_folder_icon proceeds.
+        invocations = []
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f, "FORCE_REBUILD", False)
+        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: invocations.append(a[0]))
+        f.create_folder_icon(str(folder))
+        assert len(invocations) == 1
+        assert "-r" not in invocations[0]
+
+    def test_tooltip_rewritten_when_forced(self, tmp_path, monkeypatch):
+        # Tooltip normally skipped when InfoTip matches. --force rewrites it.
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        folder = tmp_path / "show"
+        folder.mkdir()
+        f.set_folder_tooltip(str(folder), "Same tooltip")
+        ini = folder / "desktop.ini"
+        first_mtime = ini.stat().st_mtime_ns
+        import time as _t
+        _t.sleep(0.01)
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        f.set_folder_tooltip(str(folder), "Same tooltip")
+        # Force-rebuild should rewrite even though content is identical.
+        assert ini.stat().st_mtime_ns != first_mtime
+
+    def test_existing_lnk_recreated_when_forced(self, tmp_path, monkeypatch):
+        # _write_lnk normally short-circuits on existing files. --force deletes
+        # and recreates them.
+        lnk = tmp_path / "Existing.lnk"
+        lnk.write_text("placeholder")   # pretend an old shortcut is here
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        # Stub the COM bits — we only care that the old file gets deleted and
+        # _write_lnk proceeds past the existence check.
+        monkeypatch.setattr(f, "HAS_WIN32COM", False)   # logs an error after deletion, then returns
+        f._write_lnk(str(lnk), "https://example.com", "Existing")
+        # File was removed (and not recreated because HAS_WIN32COM=False).
+        assert not lnk.exists()
+
+    def test_existing_lnk_kept_when_not_forced(self, tmp_path, monkeypatch):
+        # Sanity counterpart: without --force, _write_lnk leaves existing files alone.
+        lnk = tmp_path / "Existing.lnk"
+        lnk.write_text("placeholder")
+        monkeypatch.setattr(f, "FORCE_REBUILD", False)
+        monkeypatch.setattr(f, "FORCE_REGENERATE_SHORTCUTS", False)
+        f._write_lnk(str(lnk), "https://example.com", "Existing")
+        # File untouched.
+        assert lnk.read_text() == "placeholder"
+
+
+# ---------- --force CLI guards ----------
+
+class TestForceCliGuards:
+    def _run_main(self, argv, monkeypatch):
+        """Invoke f.main() with argv; return SystemExit code (argparse uses exit)."""
+        monkeypatch.setattr("sys.argv", ["arr_finisher.py"] + argv)
+        try:
+            f.main()
+        except SystemExit as e:
+            return e.code
+        return 0
+
+    def test_force_without_service_path_errors(self, monkeypatch, capsys):
+        rc = self._run_main(["--force"], monkeypatch)
+        # argparse.error exits with code 2 and prints to stderr.
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--force" in err and "--service" in err
+
+    def test_force_with_sweep_errors(self, monkeypatch, capsys):
+        rc = self._run_main(["--sweep", "--force", "--service", "radarr",
+                             "--path", "x"], monkeypatch)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--force" in err and "--sweep" in err
+
+
 # ---------- _save_rating_cache dirty flag ----------
 
 class TestRatingCacheDirtyFlag:
@@ -983,3 +1131,235 @@ class TestRatingCacheDirtyFlag:
         import json as _json
         loaded = _json.loads(cache_path.read_text())
         assert "tt99" in loaded
+
+
+# ---------- HIGH-1 / HIGH-2: DRY_RUN respected by force-flag wipe paths ----------
+
+class TestForceDryRun:
+    """Regression: --force --dry-run (or --regenerate-shortcuts --dry-run)
+    must not mutate disk. Previously, the os.remove in _write_lnk and the
+    bulk wipe in create_shortcuts ran before the DRY_RUN check, deleting
+    files in what was supposed to be a preview-only run."""
+
+    def test_write_lnk_does_not_delete_under_dry_run(self, tmp_path, monkeypatch):
+        lnk = tmp_path / "Existing.lnk"
+        lnk.write_text("ORIGINAL")
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        f._write_lnk(str(lnk), "https://example.com", "Existing")
+        assert lnk.exists()
+        assert lnk.read_text() == "ORIGINAL"
+
+    def test_write_lnk_does_not_delete_under_dry_run_regen_shortcuts(self, tmp_path, monkeypatch):
+        # Same guarantee for the FORCE_REGENERATE_SHORTCUTS path (used by
+        # --regenerate-shortcuts) — both flags share the wipe codepath.
+        lnk = tmp_path / "Existing.lnk"
+        lnk.write_text("ORIGINAL")
+        monkeypatch.setattr(f, "FORCE_REGENERATE_SHORTCUTS", True)
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        f._write_lnk(str(lnk), "https://example.com", "Existing")
+        assert lnk.read_text() == "ORIGINAL"
+
+    def test_create_shortcuts_bulk_wipe_skipped_under_dry_run(self, tmp_path, monkeypatch):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        links = folder / "Links"
+        links.mkdir()
+        lnk = links / "IMDb.lnk"
+        vbs = links / "Subtitle.vbs"
+        lnk.write_text("PRESERVE")
+        vbs.write_text("PRESERVE")
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        f.create_shortcuts("radarr", str(folder), "tt1", "123", "Show",
+                           is_korean=False, is_anime=False, year="2024")
+        assert lnk.exists() and lnk.read_text() == "PRESERVE"
+        assert vbs.exists() and vbs.read_text() == "PRESERVE"
+
+    def test_makedirs_skipped_under_dry_run(self, tmp_path, monkeypatch):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        # Links/ doesn't exist yet
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        f.create_shortcuts("radarr", str(folder), "tt1", "123", "Show",
+                           is_korean=False, is_anime=False, year="2024")
+        # Under DRY_RUN, no Links/ directory should appear on disk.
+        assert not (folder / "Links").exists()
+
+
+# ---------- HIGH-3: get_mdl_rating malformed-JSON treated as transient ----------
+
+class TestKuryanaMalformedJson:
+    """Regression: malformed JSON from a kuryana mirror used to mask outages.
+    Mirror 0 returns 200 + garbage, mirror 1 unreachable — function used to
+    return None (silently falling back to IMDb), masking the real outage."""
+
+    def _stub_http(self, monkeypatch, responses):
+        """`responses` is a list of either ('json', body_dict) | ('raise', exc) | ('status', code)."""
+        idx = {"n": 0}
+        def fake_get(url, timeout=15):
+            i = idx["n"]
+            idx["n"] += 1
+            if i >= len(responses):
+                raise ConnectionError("ran out of stubbed responses")
+            kind, payload = responses[i]
+            if kind == "raise":
+                raise payload
+            if kind == "status":
+                class _R:
+                    status_code = payload
+                    def json(self_):
+                        return {}
+                return _R()
+            class _R:
+                status_code = 200
+                def json(self_):
+                    if isinstance(payload, Exception):
+                        raise payload
+                    return payload
+            return _R()
+        monkeypatch.setattr(f, "http", lambda: type("S", (), {"get": staticmethod(fake_get)})())
+
+    def test_all_mirrors_5xx_raises(self, monkeypatch):
+        self._stub_http(monkeypatch, [("status", 503), ("status", 503)])
+        with pytest.raises(f.ProviderUnavailable):
+            f.get_mdl_rating("Test", year="2024")
+
+    def test_malformed_then_network_error_raises(self, monkeypatch):
+        # The exact bug: mirror 0 returns 200 with body that can't be parsed
+        # as JSON; mirror 1 is unreachable. Both mirrors effectively failed;
+        # contract says raise, not return None.
+        self._stub_http(monkeypatch, [
+            ("json", ValueError("malformed")),
+            ("raise", ConnectionError("mirror 1 down")),
+        ])
+        with pytest.raises(f.ProviderUnavailable):
+            f.get_mdl_rating("Test", year="2024")
+
+    def test_malformed_then_good_returns_match(self, monkeypatch):
+        # If mirror 0 is broken but mirror 1 gives a clean response with a
+        # confident match, we should return that match.
+        self._stub_http(monkeypatch, [
+            ("json", ValueError("malformed")),
+            ("json", {"results": {"dramas": [
+                {"title": "Test Show", "year": "2024", "type": "Korean Drama",
+                 "rating": "8.5", "slug": "12345-test-show"}
+            ]}}),
+        ])
+        result = f.get_mdl_rating("Test Show", year="2024")
+        assert result == ("8.5", "MDL")
+
+    def test_404_then_404_returns_none(self, monkeypatch):
+        # Both mirrors responsive but no resource — return None (no match),
+        # NOT raise. Confirms 404 doesn't get mistaken for "transient".
+        self._stub_http(monkeypatch, [("status", 404), ("status", 404)])
+        assert f.get_mdl_rating("Nonexistent", year="2024") is None
+
+
+# ---------- MED-2: regenerate_shortcuts tiebreaker preserves classification ----------
+
+class TestRegenerateShortcutsTiebreaker:
+    """Regression: regenerate_shortcuts used to skip the env-vs-API tiebreaker
+    that _process applies. A [MAL X.X] folder whose Sonarr seriesType went
+    stale would lose its MyAnimeList.lnk on regen, then get a stray
+    MyDramaList.lnk if the language env var also lied."""
+
+    def test_mal_folder_keeps_anime_classification_via_tiebreaker(
+            self, staging, patch_providers, monkeypatch):
+        folder = os.path.join(staging, "Frieren (2023) [MAL 9.3]")
+        os.makedirs(folder)
+        fake_obj = {
+            "id": 1, "imdbId": "tt2", "tvdbId": 999,
+            "title": "Frieren (2023)", "year": 2023,
+            "seriesType": "standard",   # ← env-fast-path would say non-anime
+            "originalLanguage": {"name": "Japanese"},
+        }
+        monkeypatch.setattr(f, "get_object_by_path", lambda svc, p: fake_obj)
+        monkeypatch.setattr(f, "_default_sweep_roots", lambda: [(staging, "sonarr")])
+        patch_providers["api_says_anime"] = True   # API tiebreaker confirms anime
+        rc = f.regenerate_shortcuts()
+        assert rc == 0
+        assert os.path.isfile(os.path.join(folder, "Links", "MyAnimeList.lnk")), (
+            "Tiebreaker should have preserved anime classification → MyAnimeList.lnk created"
+        )
+
+
+# ---------- MED-4: --force preserves existing tooltip across icon wipe ----------
+
+class TestReadDesktopIniInfoTip:
+    def test_reads_existing_infotip(self, tmp_path):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "desktop.ini").write_bytes(
+            "[.ShellClassInfo]\r\nInfoTip=Some plot summary\r\n".encode("utf-16")
+        )
+        assert f._read_desktop_ini_infotip(str(folder)) == "Some plot summary"
+
+    def test_returns_none_when_no_desktop_ini(self, tmp_path):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        assert f._read_desktop_ini_infotip(str(folder)) is None
+
+    def test_returns_none_when_infotip_in_wrong_section(self, tmp_path):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "desktop.ini").write_bytes(
+            "[OtherSection]\r\nInfoTip=Wrong section\r\n".encode("utf-16")
+        )
+        assert f._read_desktop_ini_infotip(str(folder)) is None
+
+
+class TestForceRebuildPreservesTooltip:
+    def test_existing_infotip_restored_after_creator_wipes_ini(self, tmp_path, monkeypatch):
+        # Simulate the real scenario: folder has a working tooltip, --force
+        # wipes desktop.ini, Creator.exe writes a fresh one with IconResource
+        # only (no InfoTip). Without the fix, the tooltip is lost until the
+        # next webhook run fetches a fresh plot.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        ini = folder / "desktop.ini"
+        ini.write_bytes(
+            ("[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n"
+             "InfoTip=User's old tooltip\r\n").encode("utf-16")
+        )
+        # Fake Creator.exe: writes desktop.ini with IconResource only (matches
+        # real Creator.exe behavior — it doesn't preserve InfoTip).
+        def fake_creator(args, **kw):
+            ini.write_bytes(
+                "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16")
+            )
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        monkeypatch.setattr(f.subprocess, "run", fake_creator)
+        f.create_folder_icon(str(folder))
+        text = ini.read_bytes().decode("utf-16")
+        assert "InfoTip=User's old tooltip" in text, (
+            "Pre-wipe tooltip should be restored after Creator.exe overwrote desktop.ini"
+        )
+        assert "IconResource=folder.ico,0" in text, (
+            "Creator.exe's IconResource line must still be present"
+        )
+
+    def test_no_tooltip_to_preserve_is_safe(self, tmp_path, monkeypatch):
+        # Folder has IconResource but no InfoTip. Wipe + regenerate must not
+        # invent a tooltip or crash trying to restore a None.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        ini = folder / "desktop.ini"
+        ini.write_bytes(
+            "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16")
+        )
+        def fake_creator(args, **kw):
+            ini.write_bytes(
+                "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16")
+            )
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
+        monkeypatch.setattr(f, "FORCE_REBUILD", True)
+        monkeypatch.setattr(f.subprocess, "run", fake_creator)
+        f.create_folder_icon(str(folder))
+        text = ini.read_bytes().decode("utf-16")
+        assert "InfoTip=" not in text, "No tooltip should be invented from nothing"
