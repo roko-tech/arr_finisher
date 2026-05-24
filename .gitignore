@@ -10,6 +10,8 @@ __pycache__/
 
 # Logs + caches
 *.log
+# RotatingFileHandler backups: arr_finisher.log.1, .log.2, .log.3
+*.log.[0-9]*
 .rating_cache.json
 arr_finisher_setup.txt
 
