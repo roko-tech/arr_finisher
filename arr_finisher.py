@@ -969,6 +969,12 @@ def _strip_rating_suffix(name: str) -> str:
 def _has_rating_suffix(name: str) -> bool:
     return bool(_RATING_SUFFIX_RE.search(name or ''))
 
+# Files arr_finisher itself generates inside a media folder. If a merge during
+# rename_folder finds one of these on both sides, the dest copy is the current
+# one — the source copy is stale and safe to discard. Anything NOT in this set
+# is treated as user data and preserved (the original 1.0.0 behavior).
+_GENERATED_ARTIFACTS = frozenset({"folder.jpg", "folder.ico", "desktop.ini"})
+
 def rename_folder(old_path, rating, source="IMDb"):
     old_path = os.path.normpath((old_path or '').rstrip(r'\/'))
     base_name = _strip_rating_suffix(os.path.basename(old_path))
@@ -990,6 +996,23 @@ def rename_folder(old_path, rating, source="IMDb"):
                 s = os.path.join(old_path, item)
                 d = os.path.join(new_path, item)
                 if os.path.exists(d):
+                    # Conflicting arr_finisher-generated artifact: dest's copy
+                    # is the live one, discard source's stale copy. This
+                    # cleans up orphan folders left behind when Sonarr/Radarr
+                    # re-creates the source path between webhooks (e.g., for
+                    # metadata writes) — without it the user sees a leftover
+                    # folder containing only folder.jpg.
+                    if item.lower() in _GENERATED_ARTIFACTS:
+                        try:
+                            if os.path.isfile(s):
+                                os.remove(s)
+                            else:
+                                shutil.rmtree(s)
+                            log_debug(f"Discarded stale {item} from source (dest has current copy)")
+                        except OSError as e:
+                            log_warn(f"Could not discard stale {item}: {e}")
+                            skipped.append(item)
+                        continue
                     log_warn(f"File exists in destination, leaving in source: {item}")
                     skipped.append(item)
                     continue

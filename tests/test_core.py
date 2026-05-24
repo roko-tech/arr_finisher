@@ -477,6 +477,76 @@ class TestRenameMerge:
         assert not os.path.isdir(old)
         assert os.path.isfile(os.path.join(new, "ep1.mkv"))
 
+    def test_merge_discards_generated_artifacts_from_source(self, staging):
+        # Regression: a webhook-2 race that re-creates the source folder with
+        # only folder.jpg used to leave an orphan folder behind ("Merge
+        # incomplete: 1 item(s) remain") because the merge refused to delete
+        # the conflicting copy. folder.jpg / folder.ico / desktop.ini are
+        # arr_finisher-generated; dest's copy is current → safe to discard.
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        # Source has only generated artifacts (mimics Sonarr re-creating the
+        # path between webhooks for a metadata write).
+        open(os.path.join(old, "folder.jpg"), "wb").write(b"stale-poster")
+        open(os.path.join(old, "folder.ico"), "wb").write(b"stale-icon")
+        open(os.path.join(old, "desktop.ini"), "wb").write(b"stale-ini")
+        # Dest already has live copies.
+        open(os.path.join(new, "folder.jpg"), "wb").write(b"current-poster")
+        open(os.path.join(new, "folder.ico"), "wb").write(b"current-icon")
+        open(os.path.join(new, "desktop.ini"), "wb").write(b"current-ini")
+
+        f.rename_folder(old, "8.0", "IMDb")
+
+        # Source folder cleaned up — no orphan left behind.
+        assert not os.path.isdir(old), "Source orphan should be removed"
+        # Dest's live copies untouched.
+        with open(os.path.join(new, "folder.jpg"), "rb") as fh:
+            assert fh.read() == b"current-poster"
+
+    def test_merge_discards_generated_keeps_user_data(self, staging):
+        # Source has both a generated artifact (conflicts) AND user data
+        # (no conflict). Artifact gets discarded, user data moves, source
+        # folder cleaned up.
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        open(os.path.join(old, "folder.jpg"), "wb").write(b"stale-poster")
+        open(os.path.join(old, "S01E02.mkv"), "wb").write(b"new-episode")
+        open(os.path.join(new, "folder.jpg"), "wb").write(b"current-poster")
+
+        f.rename_folder(old, "8.0", "IMDb")
+
+        assert not os.path.isdir(old)
+        assert os.path.isfile(os.path.join(new, "S01E02.mkv"))
+        with open(os.path.join(new, "folder.jpg"), "rb") as fh:
+            assert fh.read() == b"current-poster"
+
+    def test_merge_user_data_conflict_still_leaves_source(self, staging):
+        # Mixed: generated artifact (safe to discard) + user data (must
+        # preserve). The user-data conflict triggers "Merge incomplete" but
+        # the generated artifact is still cleaned up so the user only has
+        # to deal with the real conflict.
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        open(os.path.join(old, "folder.jpg"), "wb").write(b"stale-poster")
+        open(os.path.join(old, "S01E01.mkv"), "wb").write(b"source-version")
+        open(os.path.join(new, "folder.jpg"), "wb").write(b"current-poster")
+        open(os.path.join(new, "S01E01.mkv"), "wb").write(b"dest-version")
+
+        f.rename_folder(old, "8.0", "IMDb")
+
+        # User data left in source for manual resolution.
+        assert os.path.isfile(os.path.join(old, "S01E01.mkv"))
+        with open(os.path.join(old, "S01E01.mkv"), "rb") as fh:
+            assert fh.read() == b"source-version"
+        # Generated artifact was discarded from source (no longer there).
+        assert not os.path.exists(os.path.join(old, "folder.jpg"))
+        # Dest's user-data version untouched.
+        with open(os.path.join(new, "S01E01.mkv"), "rb") as fh:
+            assert fh.read() == b"dest-version"
+
 
 # ---------- URL safety filter (Subtitle.vbs injection guard) ----------
 

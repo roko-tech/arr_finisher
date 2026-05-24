@@ -17,6 +17,14 @@ All notable changes to arr_finisher are listed here. Versions follow [SemVer](ht
   between the two call sites.
 
 ### Fixed
+- `rename_folder` merge no longer leaves orphan source folders when the only
+  conflicting items are arr_finisher-generated artifacts (`folder.jpg`,
+  `folder.ico`, `desktop.ini`). The source's stale copies are discarded
+  (dest's are the live ones); user data (`.mkv`, `.srt`, etc.) keeps the
+  existing protective behavior unchanged. Fixes the common scenario where
+  Sonarr/Radarr re-creates the source path between webhooks for a metadata
+  write, then a stale-path webhook 2 leaves a leftover folder containing
+  only `folder.jpg`.
 - `--regenerate-shortcuts --dry-run` and `--force --dry-run` no longer delete
   existing `.lnk` / `.vbs` files in `Links/`, and no longer create an empty
   `Links/` directory. The wipe paths in `_write_lnk` and `create_shortcuts`
