@@ -1,5 +1,6 @@
 """Pytest fixtures shared across all test modules."""
-import os, sys, shutil, tempfile
+import os, sys, shutil, tempfile, logging
+from logging.handlers import RotatingFileHandler
 import pytest
 
 # Put the script directory on sys.path so `import arr_finisher` works
@@ -8,6 +9,18 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import arr_finisher as f  # noqa
+
+# Detach the RotatingFileHandler that arr_finisher._setup_logging attached
+# to SCRIPT_DIR/arr_finisher.log at import time. Otherwise every pytest run
+# pollutes the real production log with test paths (pytest-of-X/...) and
+# noise from monkey-patched failures (stubbed Jikan 504s, missing win32com,
+# malformed-JSON tests, etc.). The stream handler to stdout is preserved so
+# pytest can capture log output for failed-test display.
+_arr_logger = logging.getLogger(f.LOGGER_NAME)
+for _h in list(_arr_logger.handlers):
+    if isinstance(_h, RotatingFileHandler):
+        _arr_logger.removeHandler(_h)
+        _h.close()
 
 
 @pytest.fixture
