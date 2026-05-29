@@ -107,7 +107,6 @@ ENABLE_SHORTCUT_MYANIMELIST   = True   # Auto-detected: only added for anime
 # Paths & Keys
 # ==========================
 ICONS_DIR = os.path.join(SCRIPT_DIR, "icons")
-FOLDER_ICON_EXE = _require_env("FOLDER_ICON_EXE")
 
 RADARR_API_URL = _require_env("RADARR_API_URL") or "http://localhost:7878"
 RADARR_API_KEY = _require_env("RADARR_API_KEY")
@@ -554,6 +553,8 @@ def set_folder_tooltip(folder_path: str, tooltip: str) -> None:
     replaced = False
     for line in lines:
         stripped = line.strip()
+        if not stripped:
+            continue  # drop blank lines (clears any legacy \r\r\n artifacts)
         if stripped.startswith("[") and stripped.endswith("]"):
             # Leaving previous section; insert InfoTip before the next section if we
             # were in ShellClassInfo and haven't replaced yet.
@@ -585,7 +586,9 @@ def set_folder_tooltip(folder_path: str, tooltip: str) -> None:
                                           | _FILE_ATTRIBUTE_SYSTEM))
         tmp_path = ini_path + ".tmp"
         # UTF-16 with BOM for max Explorer compatibility on non-ASCII tooltips.
-        with open(tmp_path, "w", encoding="utf-16") as f:
+        # newline="" so "\r\n" is written verbatim (text mode would translate
+        # \n -> \r\n, doubling it to \r\r\n).
+        with open(tmp_path, "w", encoding="utf-16", newline="") as f:
             f.write("\r\n".join(result) + "\r\n")
         os.replace(tmp_path, ini_path)
         _set_file_attrs(ini_path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_HIDDEN))
@@ -1137,12 +1140,11 @@ def _read_desktop_ini_infotip(folder_path):
     return None
 
 def _wipe_icon_state(path):
-    """Delete folder.ico + desktop.ini so the next Creator.exe run starts fresh
-    and Windows drops its cached icon for this folder. Keeps folder.jpg
-    (Creator.exe uses it as the source poster). Best-effort: file-attribute
-    flags are cleared first to allow deletion, and missing files are ignored.
-    Returns the existing InfoTip value (if any) so the caller can restore it
-    after Creator.exe rewrites desktop.ini from scratch."""
+    """Delete folder.ico + desktop.ini so the next rebuild starts fresh and
+    Windows drops its cached icon for this folder. Keeps folder.jpg (the icon
+    source poster). Best-effort: file-attribute flags are cleared first to
+    allow deletion, and missing files are ignored. Returns the existing InfoTip
+    value (if any) so the caller can restore it after desktop.ini is rewritten."""
     preserved_tip = _read_desktop_ini_infotip(path)
     for fname in ("folder.ico", "desktop.ini"):
         target = os.path.join(path, fname)
@@ -1160,6 +1162,148 @@ def _wipe_icon_state(path):
     _set_file_attrs(path, remove=(_FILE_ATTRIBUTE_READONLY | _FILE_ATTRIBUTE_SYSTEM))
     return preserved_tip
 
+# ==========================
+# Folder icon — native port of Folder-Icon-Creator (Creator.exe)
+# ==========================
+# Resolutions packed into folder.ico, matching Folder-Icon-Creator exactly.
+_ICO_SIZES = (256, 192, 128, 96, 64, 48, 32, 16)
+_POSTER_NAME = "folder.jpg"
+_ICON_NAME = "folder.ico"
+
+def _pillow_available():
+    """True if Pillow can be imported (required to build folder.ico)."""
+    try:
+        import PIL  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def _build_folder_ico(poster_path, ico_path):
+    """Build a multi-resolution folder.ico from the poster image.
+
+    Mirrors Folder-Icon-Creator: resize the poster to fit inside 256x256
+    (preserving aspect ratio), center it on a transparent 256x256 canvas, then
+    write an .ico containing the sizes in _ICO_SIZES. Returns True on success."""
+    try:
+        from PIL import Image
+    except ImportError:
+        log_err("Pillow not installed; cannot build folder icon. Run: pip install Pillow")
+        return False
+    tmp_path = ico_path + ".tmp"
+    try:
+        with Image.open(poster_path) as im:
+            img = im.convert("RGBA")
+            # Fit inside 256x256, preserving aspect ratio (ImageMagick Resize).
+            img.thumbnail((256, 256), Image.LANCZOS)
+            # Center on a fully-transparent 256x256 canvas (Extent, Gravity.Center).
+            canvas = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+            canvas.paste(img, ((256 - img.width) // 2, (256 - img.height) // 2))
+            canvas.save(tmp_path, format="ICO", sizes=[(s, s) for s in _ICO_SIZES])
+        os.replace(tmp_path, ico_path)
+        return True
+    except Exception as e:
+        log_err(f"Failed to build {_ICON_NAME} from {poster_path}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+def _apply_icon_to_desktop_ini(folder_path):
+    """Write folder's desktop.ini so Explorer points at folder.ico, preserving
+    any existing InfoTip tooltip. UTF-16 + atomic write, then mark the file
+    Hidden+System. Mirrors Creator.exe's CreateDesktopIniFile (minus the
+    parent-folder-name InfoTip, which set_folder_tooltip owns here)."""
+    ini_path = os.path.join(folder_path, "desktop.ini")
+    infotip = _read_desktop_ini_infotip(folder_path)
+    lines = [
+        "[.ShellClassInfo]",
+        f"IconResource={_ICON_NAME},0",
+        f"IconFile={_ICON_NAME}",
+        "IconIndex=0",
+    ]
+    if infotip:
+        lines.append(f"InfoTip={infotip}")
+    lines += ["[ViewState]", "FolderType=Videos"]
+    tmp_path = ini_path + ".tmp"
+    try:
+        _set_file_attrs(ini_path, remove=(_FILE_ATTRIBUTE_READONLY
+                                          | _FILE_ATTRIBUTE_HIDDEN
+                                          | _FILE_ATTRIBUTE_SYSTEM))
+        # newline="" so "\r\n" is written verbatim (text mode would otherwise
+        # translate \n -> \r\n, producing \r\r\n and blank lines between keys).
+        with open(tmp_path, "w", encoding="utf-16", newline="") as fh:
+            fh.write("\r\n".join(lines) + "\r\n")
+        os.replace(tmp_path, ini_path)
+        _set_file_attrs(ini_path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_HIDDEN))
+        return True
+    except Exception as e:
+        log_err(f"Failed to write desktop.ini in {folder_path}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+def _bind_folder_icon(folder_path, icon_filename=_ICON_NAME):
+    """Bind the folder icon immediately via the undocumented Shell32 API
+    SHGetSetFolderCustomSettings (FCSM_ICONFILE + FCS_FORCEWRITE) — the same
+    call Creator.exe makes. The desktop.ini mechanism already works without
+    this; it just forces Explorer to pick the icon up now rather than waiting
+    for a cache refresh. Best-effort: any failure is logged and ignored."""
+    if os.name != "nt":
+        return
+    try:
+        from ctypes import wintypes
+
+        class _SHFOLDERCUSTOMSETTINGS(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("dwMask", wintypes.DWORD),
+                ("pvid", ctypes.c_void_p),
+                ("pszWebViewTemplate", wintypes.LPWSTR),
+                ("cchWebViewTemplate", wintypes.DWORD),
+                ("pszWebViewTemplateVersion", wintypes.LPWSTR),
+                ("pszInfoTip", wintypes.LPWSTR),
+                ("cchInfoTip", wintypes.DWORD),
+                ("pclsid", ctypes.c_void_p),
+                ("dwFlags", wintypes.DWORD),
+                ("pszIconFile", wintypes.LPWSTR),
+                ("cchIconFile", wintypes.DWORD),
+                ("iIconIndex", ctypes.c_int),
+                ("pszLogo", wintypes.LPWSTR),
+                ("cchLogo", wintypes.DWORD),
+            ]
+
+        fcs = _SHFOLDERCUSTOMSETTINGS()
+        fcs.dwSize = ctypes.sizeof(_SHFOLDERCUSTOMSETTINGS)
+        fcs.dwMask = 0x10            # FCSM_ICONFILE
+        fcs.pszIconFile = icon_filename
+        fcs.iIconIndex = 0
+        func = ctypes.windll.shell32.SHGetSetFolderCustomSettings
+        func.argtypes = [ctypes.POINTER(_SHFOLDERCUSTOMSETTINGS),
+                         wintypes.LPCWSTR, wintypes.DWORD]
+        func.restype = ctypes.c_long
+        func(ctypes.byref(fcs), folder_path, 2)   # FCS_FORCEWRITE
+    except Exception as e:
+        log_debug(f"SHGetSetFolderCustomSettings failed (icon still set via desktop.ini): {e}")
+
+def _refresh_icon_cache():
+    """Flush Explorer's shell icon cache so a newly-set folder icon repaints,
+    via the built-in ie4uinit.exe (the Windows 10/11 '-show' path)."""
+    if os.name != "nt":
+        return
+    try:
+        ie4uinit = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                "System32", "ie4uinit.exe")
+        if os.path.isfile(ie4uinit):
+            subprocess.run([ie4uinit, "-show"], check=False,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        log_debug(f"Icon cache refresh failed: {e}")
+
 def create_folder_icon(path):
     if not ENABLE_CREATE_FOLDER_ICON:
         return
@@ -1167,29 +1311,40 @@ def create_folder_icon(path):
         if _desktop_ini_has_icon(path) and not FORCE_REBUILD:
             log_debug("Folder icon already set; skipping")
             return
-        if DRY_RUN:
-            log(f"[DRY RUN] Would run FolderIconCreator on {path}")
+        poster = os.path.join(path, _POSTER_NAME)
+        if not os.path.isfile(poster):
+            log_debug(f"No {_POSTER_NAME} in {path}; skipping folder icon")
             return
-        # Under --force, wipe folder.ico + desktop.ini first. The wipe is
-        # what actually breaks Windows' folder-icon cache — Explorer keys its
-        # cache off the file's path, so deleting and recreating reads fresh.
-        # Still pass -r as belt-and-suspenders in case some attribute survives.
+        if DRY_RUN:
+            log(f"[DRY RUN] Would build folder icon for {path}")
+            return
+        # Under --force, wipe folder.ico + desktop.ini first. The wipe is what
+        # actually breaks Windows' folder-icon cache — Explorer keys its cache
+        # off the path, so deleting and recreating reads fresh. _wipe_icon_state
+        # also returns any existing tooltip so we can restore it afterward.
         preserved_tip = None
-        force_args = []
         if FORCE_REBUILD:
             preserved_tip = _wipe_icon_state(path)
-            force_args = ["-r"]
-        subprocess.run([FOLDER_ICON_EXE, "-h", *force_args, "-f", path], check=False)
+        ico = os.path.join(path, _ICON_NAME)
+        if not _build_folder_ico(poster, ico):
+            return
+        _apply_icon_to_desktop_ini(path)
+        # Minimal hide: keep the files we generate (poster + icon) out of the
+        # Explorer view. The folder itself must be Read-Only (or System) for
+        # Windows to honor desktop.ini at all.
+        _set_file_attrs(poster, add=_FILE_ATTRIBUTE_HIDDEN)
+        _set_file_attrs(ico, add=_FILE_ATTRIBUTE_HIDDEN)
         _set_file_attrs(path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_READONLY))
-        log("FolderIconCreator OK")
-        # Restore any pre-wipe InfoTip. Creator.exe rewrites desktop.ini from
-        # scratch, so without this the user's tooltip is lost whenever OMDb
-        # has no plot for the title (later set_folder_tooltip call would be
-        # skipped). If OMDb DOES return a plot, the later call overwrites.
+        _bind_folder_icon(path)
+        _refresh_icon_cache()
+        log("Folder icon created")
+        # Restore any pre-wipe InfoTip (only the --force path wipes). If OMDb
+        # later returns a plot, the set_folder_tooltip call in _process
+        # overwrites this with the richer tooltip.
         if preserved_tip:
             set_folder_tooltip(path, preserved_tip)
     except Exception as e:
-        log_err(f"FolderIconCreator failed: {e}")
+        log_err(f"Folder icon creation failed: {e}")
 
 # ==========================
 # .lnk helper
@@ -1207,6 +1362,11 @@ def _write_lnk(path, target, name):
                 log_err(f"Could not remove existing {path} for regeneration: {e}")
                 return
         else:
+            # Defensive: clear HIDDEN so shortcuts stay visible across re-runs.
+            # (Legacy runs that used Creator.exe -h recursively hid every
+            # non-video file, including .lnk in Links/; the native icon path
+            # only hides folder.jpg/folder.ico, but old state may linger.)
+            _set_file_attrs(path, remove=_FILE_ATTRIBUTE_HIDDEN)
             log_debug(f"Already exists: {os.path.basename(path)}")
             return
     if not HAS_WIN32COM:
@@ -1841,11 +2001,12 @@ def validate_config():
     else:
         fail("module  pywin32 missing — shortcut creation will be skipped")
 
-    # FolderIconCreator.exe
-    if FOLDER_ICON_EXE and os.path.isfile(FOLDER_ICON_EXE):
-        ok(f"file  FolderIconCreator at {FOLDER_ICON_EXE}")
+    # Pillow — builds folder.ico natively (replaces the old Creator.exe).
+    if _pillow_available():
+        import PIL
+        ok(f"module  Pillow available ({PIL.__version__})")
     else:
-        fail(f"file  FolderIconCreator missing at {FOLDER_ICON_EXE or '(unset)'}")
+        fail("module  Pillow missing — folder icons can't be built (pip install Pillow)")
 
     # Icons directory. Only check for icons we actually use as .lnk display
     # icons (SubDL.ico / Subsource.ico in the repo are legacy assets from when
@@ -2245,11 +2406,6 @@ def _check_critical_config(sonarr_event=None, radarr_event=None):
     if radarr_event and not RADARR_API_KEY:
         missing.append(("RADARR_API_KEY",
                         "Radarr → Settings → General → API Key"))
-    if ENABLE_CREATE_FOLDER_ICON and (not FOLDER_ICON_EXE
-                                       or not os.path.isfile(FOLDER_ICON_EXE)):
-        missing.append(("FOLDER_ICON_EXE",
-                        "Absolute path to Folder-Icon-Creator's Creator.exe. "
-                        "See README install steps."))
     return missing
 
 def _update_setup_help(missing):

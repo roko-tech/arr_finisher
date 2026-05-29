@@ -103,8 +103,13 @@ def patch_providers(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def disable_external_tools(monkeypatch):
-    """Don't actually call FolderIconCreator.exe during tests."""
+    """Keep folder-icon creation off by default, and neutralize its Windows
+    side-effects (shell-API icon bind + ie4uinit cache refresh) for the tests
+    that do enable it — so they exercise the file logic without touching the
+    real shell."""
     monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", False)
+    monkeypatch.setattr(f, "_bind_folder_icon", lambda *a, **k: None)
+    monkeypatch.setattr(f, "_refresh_icon_cache", lambda *a, **k: None)
 
 
 @pytest.fixture(autouse=True)

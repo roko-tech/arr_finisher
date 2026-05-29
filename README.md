@@ -29,7 +29,7 @@ Then in Sonarr/Radarr: **Settings → Connect → Custom Script**, point at
 
 | Output | How |
 |---|---|
-| **Folder icon from the show's poster** | Drives [maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator) — the original motivation for this project |
+| **Folder icon from the show's poster** | Generates `folder.ico` natively (Pillow + Windows shell APIs) — a port of [maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator), the original motivation for this project |
 | **Rating suffix in folder name** | `[IMDb 8.6]`, `[MDL 7.5]`, or `[MAL 9.3]` — picks the best source automatically (see below) |
 | **`Links/` subfolder with shortcuts** | IMDb, Parents Guide, TVTime, Letterboxd, MyDramaList, MyAnimeList, Twitter, combined Subtitle (SubDL + Subsource + OpenSubtitles) |
 | **Explorer tooltip** | OMDb plot summary + rating shown on hover, via `desktop.ini` `InfoTip` |
@@ -56,7 +56,7 @@ arr_finisher.bat  ─►  python arr_finisher.py
         ├─ fetch rating from MAL / MDL / IMDb (in that priority order)
         ├─ rename folder, appending "[SOURCE X.X]"
         ├─ PUT new path back to Sonarr/Radarr (rollback on API rejection)
-        ├─ run Folder-Icon-Creator to generate a .ico from the poster
+        ├─ generate folder.ico from the poster + bind it via the shell API
         ├─ create Links/ subfolder with .lnk + Subtitle.vbs shortcuts
         └─ write plot summary into desktop.ini as Explorer InfoTip
 ```
@@ -69,9 +69,9 @@ ignored — only `Download` events trigger the work above.
 ## Install
 
 **Prerequisites:**
-- Windows (`pywin32` is used to create `.lnk` shortcut files)
+- Windows (`pywin32` is used to create `.lnk` shortcut files; folder icons use Windows shell APIs)
 - Python 3.8+
-- [maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator) — download a release, extract (e.g. to `D:\Tools\FolderIconCreator\`), and note the path to `Creator.exe`
+- `Pillow` (installed via `requirements.txt`) — builds the `folder.ico`; no external tool needed
 
 **Install the script:**
 
@@ -100,7 +100,6 @@ variables override the file.
 | Key | What it's for |
 |---|---|
 | `OMDB_API_KEY` | Free key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx). Needed for the plot-summary tooltip, and as the IMDb-rating fallback when IMDb's GraphQL endpoint is unreachable |
-| `FOLDER_ICON_EXE` | Absolute path to Folder-Icon-Creator's `Creator.exe` (only if `ENABLE_CREATE_FOLDER_ICON` is on — it is, by default) |
 | `SONARR_API_KEY` | Sonarr → Settings → General → API Key. Required if you'll trigger from Sonarr |
 | `RADARR_API_KEY` | Radarr → Settings → General → API Key. Required if you'll trigger from Radarr |
 
@@ -235,7 +234,7 @@ python arr_finisher.py --verbose                                   # include DEB
   [OK ] env  SUBDL_API_KEY is set
   [OK ] env  OPENSUBTITLES_API_KEY is set
   [OK ] module  pywin32 available
-  [OK ] file  FolderIconCreator at D:\Tools\FolderIconCreator\Creator.exe
+  [OK ] module  Pillow available (11.3.0)
   [OK ] icons  all 10 icon files present
   [OK ] http  Sonarr reachable (200)
   [OK ] http  Radarr reachable (200)
@@ -295,7 +294,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the version history.
 
 ## Credits
 
-- **[maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator)** — the folder-icon generator this whole project is built around. None of this exists without it.
+- **[maforget/Folder-Icon-Creator](https://github.com/maforget/Folder-Icon-Creator)** — the folder-icon generator this whole project is built around. Its icon-creation logic is now reimplemented natively in Python (Pillow + the shell APIs it reverse-engineered to), but none of this exists without it.
 - **[kuryana](https://github.com/tbdsux/kuryana)** — unofficial MyDramaList API.
 - **[jikan](https://jikan.moe)** — unofficial MyAnimeList API.
 - **[OMDb](https://www.omdbapi.com)** — ratings + plot summaries.

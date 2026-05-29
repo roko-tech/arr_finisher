@@ -995,6 +995,17 @@ class TestTooltipWriter:
 
 # ---------- create_folder_icon: only skip when icon already declared ----------
 
+def _fake_build_writing_ico(record):
+    """Return a _build_folder_ico stand-in that records calls and writes a
+    placeholder folder.ico so the rest of create_folder_icon can proceed."""
+    def _build(poster, ico):
+        record["n"] = record.get("n", 0) + 1
+        with open(ico, "wb") as fh:
+            fh.write(b"ico")
+        return True
+    return _build
+
+
 class TestFolderIconSkip:
     def test_tooltip_only_desktop_ini_does_not_block_icon(self, tmp_path, monkeypatch):
         # Simulate the scenario: an earlier run wrote a tooltip (so
@@ -1002,28 +1013,88 @@ class TestFolderIconSkip:
         # run with ENABLE_CREATE_FOLDER_ICON=True must NOT short-circuit.
         folder = tmp_path / "show"
         folder.mkdir()
+        (folder / "folder.jpg").write_bytes(b"poster")
         (folder / "desktop.ini").write_bytes(
             "[.ShellClassInfo]\r\nInfoTip=tooltip without icon\r\n".encode("utf-16")
         )
-        called = {"n": 0}
+        built = {}
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
-        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: called.__setitem__("n", called["n"] + 1))
+        monkeypatch.setattr(f, "_build_folder_ico", _fake_build_writing_ico(built))
         f.create_folder_icon(str(folder))
-        assert called["n"] == 1   # Creator.exe was invoked
+        assert built.get("n") == 1   # the icon was built (not short-circuited)
 
     def test_desktop_ini_with_icon_resource_skips(self, tmp_path, monkeypatch):
         folder = tmp_path / "show"
         folder.mkdir()
+        (folder / "folder.jpg").write_bytes(b"poster")
         (folder / "desktop.ini").write_bytes(
             "[.ShellClassInfo]\r\nIconResource=poster.ico,0\r\n".encode("utf-16")
         )
-        called = {"n": 0}
+        built = {}
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
-        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: called.__setitem__("n", called["n"] + 1))
+        monkeypatch.setattr(f, "_build_folder_ico", _fake_build_writing_ico(built))
         f.create_folder_icon(str(folder))
-        assert called["n"] == 0   # short-circuited
+        assert built.get("n") is None   # short-circuited; never built
+
+    def test_no_poster_skips(self, tmp_path, monkeypatch):
+        # No folder.jpg → nothing to build an icon from; must skip cleanly.
+        folder = tmp_path / "show"
+        folder.mkdir()
+        built = {}
+        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
+        monkeypatch.setattr(f, "_build_folder_ico", _fake_build_writing_ico(built))
+        f.create_folder_icon(str(folder))
+        assert built.get("n") is None
+
+
+# ---------- _build_folder_ico: native poster -> multi-size .ico ----------
+
+class TestBuildFolderIco:
+    def test_produces_all_sizes_on_transparent_canvas(self, tmp_path):
+        from PIL import Image
+        jpg = tmp_path / "folder.jpg"
+        # 2:3 poster, to exercise the fit-and-center-pad path.
+        Image.new("RGB", (600, 900), (200, 30, 30)).save(str(jpg), "JPEG")
+        ico = tmp_path / "folder.ico"
+        assert f._build_folder_ico(str(jpg), str(ico)) is True
+        with Image.open(str(ico)) as im:
+            assert set(im.ico.sizes()) == {(s, s) for s in f._ICO_SIZES}
+            # 256 frame is a square canvas with transparent padding around a
+            # portrait poster — the top-left corner must be fully transparent.
+            frame = im.ico.getimage((256, 256)).convert("RGBA")
+            assert frame.getpixel((0, 0))[3] == 0
+
+    def test_returns_false_on_unreadable_image(self, tmp_path):
+        bad = tmp_path / "folder.jpg"
+        bad.write_bytes(b"this is not an image")
+        ico = tmp_path / "folder.ico"
+        assert f._build_folder_ico(str(bad), str(ico)) is False
+        assert not ico.exists()           # no partial/leftover .ico
+
+
+# ---------- _apply_icon_to_desktop_ini: icon keys, preserve InfoTip ----------
+
+class TestApplyIconToDesktopIni:
+    def test_writes_icon_keys_and_foldertype(self, tmp_path):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        assert f._apply_icon_to_desktop_ini(str(folder)) is True
+        text = (folder / "desktop.ini").read_bytes().decode("utf-16")
+        assert "IconResource=folder.ico,0" in text
+        assert "IconFile=folder.ico" in text
+        assert "IconIndex=0" in text
+        assert "FolderType=Videos" in text
+
+    def test_preserves_existing_infotip(self, tmp_path):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "desktop.ini").write_bytes(
+            "[.ShellClassInfo]\r\nInfoTip=Keep this plot\r\n".encode("utf-16")
+        )
+        assert f._apply_icon_to_desktop_ini(str(folder)) is True
+        text = (folder / "desktop.ini").read_bytes().decode("utf-16")
+        assert "InfoTip=Keep this plot" in text
+        assert "IconResource=folder.ico,0" in text
 
 
 # ---------- --force / FORCE_REBUILD: bypass idempotency skips ----------
@@ -1031,25 +1102,23 @@ class TestFolderIconSkip:
 class TestForceRebuild:
     def test_icon_skip_bypassed_when_forced(self, tmp_path, monkeypatch):
         # An IconResource line normally short-circuits create_folder_icon.
-        # With FORCE_REBUILD=True, Creator.exe must run and be told -r so the
-        # external binary recreates the icon instead of skipping it.
+        # With FORCE_REBUILD=True, the icon must be rebuilt anyway.
         folder = tmp_path / "show"
         folder.mkdir()
+        (folder / "folder.jpg").write_bytes(b"poster")
         (folder / "desktop.ini").write_bytes(
             "[.ShellClassInfo]\r\nIconResource=poster.ico,0\r\n".encode("utf-16")
         )
-        invocations = []
+        built = {}
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
         monkeypatch.setattr(f, "FORCE_REBUILD", True)
-        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: invocations.append(a[0]))
+        monkeypatch.setattr(f, "_build_folder_ico", _fake_build_writing_ico(built))
         f.create_folder_icon(str(folder))
-        assert len(invocations) == 1
-        assert "-r" in invocations[0]
+        assert built.get("n") == 1   # rebuilt despite an existing IconResource
 
     def test_icon_wipes_existing_files_when_forced(self, tmp_path, monkeypatch):
-        # --force must delete folder.ico + desktop.ini BEFORE Creator.exe runs,
-        # so Windows drops its cached icon for this folder path.
+        # --force must delete folder.ico + desktop.ini BEFORE the rebuild, so
+        # Windows drops its cached icon for this folder path.
         folder = tmp_path / "show"
         folder.mkdir()
         ico = folder / "folder.ico"
@@ -1057,56 +1126,44 @@ class TestForceRebuild:
         jpg = folder / "folder.jpg"
         ico.write_bytes(b"old-icon-bytes")
         ini.write_bytes("[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16"))
-        jpg.write_bytes(b"poster-source")   # must be preserved (Creator.exe needs it)
+        jpg.write_bytes(b"poster-source")   # must be preserved (icon source)
 
-        present_at_subprocess = {}
-        def fake_run(args, **kw):
-            # Snapshot which files exist when Creator.exe is invoked
-            present_at_subprocess["ico"] = ico.exists()
-            present_at_subprocess["ini"] = ini.exists()
-            present_at_subprocess["jpg"] = jpg.exists()
+        present_at_build = {}
+        def fake_build(poster, ico_path):
+            # Snapshot which files exist when the rebuild starts.
+            present_at_build["ico"] = ico.exists()
+            present_at_build["ini"] = ini.exists()
+            present_at_build["jpg"] = jpg.exists()
+            with open(ico_path, "wb") as fh:
+                fh.write(b"ico")
+            return True
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
         monkeypatch.setattr(f, "FORCE_REBUILD", True)
-        monkeypatch.setattr(f.subprocess, "run", fake_run)
+        monkeypatch.setattr(f, "_build_folder_ico", fake_build)
         f.create_folder_icon(str(folder))
-        assert present_at_subprocess["ico"] is False, "folder.ico must be deleted before Creator.exe runs"
-        assert present_at_subprocess["ini"] is False, "desktop.ini must be deleted before Creator.exe runs"
-        assert present_at_subprocess["jpg"] is True,  "folder.jpg must be preserved (Creator.exe poster source)"
+        assert present_at_build["ico"] is False, "folder.ico must be wiped before rebuild"
+        assert present_at_build["ini"] is False, "desktop.ini must be wiped before rebuild"
+        assert present_at_build["jpg"] is True,  "folder.jpg must be preserved (icon source)"
 
     def test_icon_does_not_wipe_without_force(self, tmp_path, monkeypatch):
         # Without --force, the wipe must NOT happen — webhook + sweep behavior
-        # depends on Creator.exe's own idempotency.
+        # relies on the idempotency skip, not on pre-deleting files.
         folder = tmp_path / "show"
         folder.mkdir()
+        (folder / "folder.jpg").write_bytes(b"poster")
         # No existing desktop.ini → create_folder_icon proceeds past the skip,
         # but should not pre-delete anything else.
         ico = folder / "folder.ico"
         ico.write_bytes(b"do-not-delete-me")
         present = {}
-        def fake_run(args, **kw):
+        def fake_build(poster, ico_path):
             present["ico"] = ico.exists()
+            return True   # don't overwrite — we're checking the wipe didn't run
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
         monkeypatch.setattr(f, "FORCE_REBUILD", False)
-        monkeypatch.setattr(f.subprocess, "run", fake_run)
+        monkeypatch.setattr(f, "_build_folder_ico", fake_build)
         f.create_folder_icon(str(folder))
         assert present["ico"] is True, "folder.ico must NOT be wiped when --force is off"
-
-    def test_icon_no_dash_r_without_force(self, tmp_path, monkeypatch):
-        # Without --force, the -r flag must NOT be added (so we don't disrupt
-        # webhook / sweep behavior that relies on Creator.exe's own idempotency).
-        folder = tmp_path / "show"
-        folder.mkdir()
-        # No desktop.ini at all → create_folder_icon proceeds.
-        invocations = []
-        monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
-        monkeypatch.setattr(f, "FORCE_REBUILD", False)
-        monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: invocations.append(a[0]))
-        f.create_folder_icon(str(folder))
-        assert len(invocations) == 1
-        assert "-r" not in invocations[0]
 
     def test_tooltip_rewritten_when_forced(self, tmp_path, monkeypatch):
         # Tooltip normally skipped when InfoTip matches. --force rewrites it.
@@ -1380,36 +1437,30 @@ class TestReadDesktopIniInfoTip:
 
 
 class TestForceRebuildPreservesTooltip:
-    def test_existing_infotip_restored_after_creator_wipes_ini(self, tmp_path, monkeypatch):
-        # Simulate the real scenario: folder has a working tooltip, --force
-        # wipes desktop.ini, Creator.exe writes a fresh one with IconResource
-        # only (no InfoTip). Without the fix, the tooltip is lost until the
-        # next webhook run fetches a fresh plot.
+    def test_existing_infotip_restored_after_wipe(self, tmp_path, monkeypatch):
+        # Real scenario: folder has a working tooltip, --force wipes desktop.ini,
+        # the rebuild writes a fresh one with IconResource only (no InfoTip).
+        # Without the restore, the tooltip is lost until the next webhook run
+        # fetches a fresh plot.
         folder = tmp_path / "show"
         folder.mkdir()
+        (folder / "folder.jpg").write_bytes(b"poster")
         ini = folder / "desktop.ini"
         ini.write_bytes(
             ("[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n"
              "InfoTip=User's old tooltip\r\n").encode("utf-16")
         )
-        # Fake Creator.exe: writes desktop.ini with IconResource only (matches
-        # real Creator.exe behavior — it doesn't preserve InfoTip).
-        def fake_creator(args, **kw):
-            ini.write_bytes(
-                "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16")
-            )
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
         monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
         monkeypatch.setattr(f, "FORCE_REBUILD", True)
-        monkeypatch.setattr(f.subprocess, "run", fake_creator)
+        monkeypatch.setattr(f, "_build_folder_ico", _fake_build_writing_ico({}))
         f.create_folder_icon(str(folder))
         text = ini.read_bytes().decode("utf-16")
         assert "InfoTip=User's old tooltip" in text, (
-            "Pre-wipe tooltip should be restored after Creator.exe overwrote desktop.ini"
+            "Pre-wipe tooltip should be restored after the desktop.ini rewrite"
         )
         assert "IconResource=folder.ico,0" in text, (
-            "Creator.exe's IconResource line must still be present"
+            "The IconResource line must still be present"
         )
 
     def test_no_tooltip_to_preserve_is_safe(self, tmp_path, monkeypatch):
@@ -1417,19 +1468,15 @@ class TestForceRebuildPreservesTooltip:
         # invent a tooltip or crash trying to restore a None.
         folder = tmp_path / "show"
         folder.mkdir()
+        (folder / "folder.jpg").write_bytes(b"poster")
         ini = folder / "desktop.ini"
         ini.write_bytes(
             "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16")
         )
-        def fake_creator(args, **kw):
-            ini.write_bytes(
-                "[.ShellClassInfo]\r\nIconResource=folder.ico,0\r\n".encode("utf-16")
-            )
         monkeypatch.setattr(f, "ENABLE_CREATE_FOLDER_ICON", True)
         monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
-        monkeypatch.setattr(f, "FOLDER_ICON_EXE", "stub.exe")
         monkeypatch.setattr(f, "FORCE_REBUILD", True)
-        monkeypatch.setattr(f.subprocess, "run", fake_creator)
+        monkeypatch.setattr(f, "_build_folder_ico", _fake_build_writing_ico({}))
         f.create_folder_icon(str(folder))
         text = ini.read_bytes().decode("utf-16")
         assert "InfoTip=" not in text, "No tooltip should be invented from nothing"

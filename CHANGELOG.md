@@ -9,14 +9,31 @@ All notable changes to arr_finisher are listed here. Versions follow [SemVer](ht
   shortcuts, and tooltip even when they're already up to date. Bypasses the
   idempotency skips that otherwise make a re-run of an unchanged folder a no-op.
   Single-folder only; rejected with `--sweep` or `--regenerate-shortcuts`.
-  Under the hood: wipes `folder.ico` + `desktop.ini` before calling
-  `Creator.exe -r` (busts Windows' per-path icon cache) and forces every
-  `Links/*.lnk` and the tooltip to be rewritten.
+  Under the hood: wipes `folder.ico` + `desktop.ini` before rebuilding the
+  icon (busts Windows' per-path icon cache) and forces every `Links/*.lnk`
+  and the tooltip to be rewritten.
 - `_apply_content_class_tiebreaker` helper, used by both `_process` and
   `regenerate_shortcuts` so the env-vs-API tiebreaker logic doesn't drift
   between the two call sites.
 
+### Changed
+- **Folder icons are now generated natively** — the external Folder-Icon-Creator
+  binary (`Creator.exe`) is no longer required or invoked. `folder.ico` is built
+  with Pillow (poster resized to fit 256×256, centered on a transparent canvas,
+  sizes 256→16) and bound via the same Windows shell APIs the tool used
+  (`SHGetSetFolderCustomSettings` + an `ie4uinit.exe` cache refresh). The
+  `FOLDER_ICON_EXE` setting and the external download are gone from setup.
+  - Add `Pillow` to your environment: `pip install -r requirements.txt`.
+  - Metadata hiding is now minimal — only the generated `folder.jpg` and
+    `folder.ico` are hidden. The old path passed `-h`, which recursively hid
+    every non-media file (`.nfo`, extra art, …); those stay visible now.
+
 ### Fixed
+- `set_folder_tooltip` no longer writes doubled line endings (`\r\r\n`) into
+  `desktop.ini` — text-mode newline translation turned each `\r\n` into
+  `\r\r\n`. Now writes with `newline=""` and drops blank lines, so existing
+  files with the old artifacts self-heal on the next write. (Harmless to
+  Explorer either way, but the files are now well-formed.)
 - `rename_folder` merge no longer leaves orphan source folders when the only
   conflicting items are arr_finisher-generated artifacts (`folder.jpg`,
   `folder.ico`, `desktop.ini`). The source's stale copies are discarded
@@ -37,9 +54,9 @@ All notable changes to arr_finisher are listed here. Versions follow [SemVer](ht
   tiebreaker. A folder whose Sonarr `seriesType` env var went stale used to
   silently lose its MyAnimeList/MyDramaList shortcut on regen.
 - `--force` now preserves any existing folder tooltip across the `desktop.ini`
-  wipe — restored as a fallback after `Creator.exe` writes a fresh
-  `desktop.ini`. If OMDb later returns a plot, the regular tooltip path
-  overwrites it; if OMDb has nothing, the user's previous tooltip survives.
+  wipe — restored as a fallback after the fresh `desktop.ini` is written. If
+  OMDb later returns a plot, the regular tooltip path overwrites it; if OMDb
+  has nothing, the user's previous tooltip survives.
 - README's "Sweep roots" section no longer claims a hardcoded
   `D:\TV Shows / D:\Anime / E:\Movies` fallback (the fallback was removed in
   1.0.0 but the doc was stale).
