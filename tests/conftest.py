@@ -114,12 +114,23 @@ def disable_external_tools(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clear_module_caches():
-    """Korean/anime detection caches are module-level dicts. Reset each test."""
+    """Module-level caches are process-global dicts. Reset each test so a
+    populated _library_cache / detection cache can't leak across tests."""
     f._korean_cache.clear()
     f._anime_cache.clear()
+    f._library_cache.clear()
     yield
     f._korean_cache.clear()
     f._anime_cache.clear()
+    f._library_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _stable_cache_ttl(monkeypatch):
+    """The freshness tests assume the default 7-day TTL. Pin it so a developer's
+    local .env (which is loaded at import and may set
+    ARR_FINISHER_RATING_CACHE_TTL_DAYS=0) can't make the suite fail."""
+    monkeypatch.setattr(f, "RATING_CACHE_TTL_DAYS", 7)
 
 
 @pytest.fixture

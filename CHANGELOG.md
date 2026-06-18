@@ -15,6 +15,12 @@ All notable changes to arr_finisher are listed here. Versions follow [SemVer](ht
 - `_apply_content_class_tiebreaker` helper, used by both `_process` and
   `regenerate_shortcuts` so the env-vs-API tiebreaker logic doesn't drift
   between the two call sites.
+- `--check-rollbacks` command: scans `.rollbacks.log` for unresolved `FAIL`
+  entries (disk/service desync) and exits non-zero if any are found, so the
+  rare-but-serious case no longer relies on the user remembering to grep.
+- `ENABLE_HIDE_METADATA` feature toggle (default off): also hides `.nfo` +
+  extra-artwork sidecars in each folder, restoring the cleaner Explorer view
+  the old Creator.exe `-h` produced — opt-in, without the aggressive default.
 
 ### Changed
 - **Folder icons are now generated natively** — the external Folder-Icon-Creator
@@ -60,11 +66,53 @@ All notable changes to arr_finisher are listed here. Versions follow [SemVer](ht
 - README's "Sweep roots" section no longer claims a hardcoded
   `D:\TV Shows / D:\Anime / E:\Movies` fallback (the fallback was removed in
   1.0.0 but the doc was stale).
+- `--dry-run` is now honored by `rename_folder`'s merge branch. The merge
+  (`shutil.move` / `rmtree`) previously ran *before* the `DRY_RUN` check, so a
+  preview run (`--sweep --dry-run`) could move files and delete the source
+  folder when the rated-name destination already existed.
+- The rating-freshness cache is no longer marked fresh after a rolled-back or
+  failed rename. A successful disk rename + rejected API PUT + rollback used to
+  still cache the new rating, so the next sweep skipped the folder for the whole
+  TTL — defeating the retry the rollback exists to enable.
+- A Sonarr/Radarr outage during `--sweep` now aborts the affected root and
+  exits non-zero, instead of mislabeling the entire library as "unknown
+  folders" with a falsely-green exit 0. `get_object_by_path` raises
+  `ServiceUnavailable` (distinct from "folder not in library").
+- Concurrent webhook processes no longer clobber each other's rating-cache
+  entries: `_save_rating_cache` re-reads the on-disk cache and merges only the
+  keys this process changed (burst imports each ran in their own process and
+  the last whole-file writer dropped the others' entries).
+- `--clear-cache` now respects `--dry-run` (it deleted the cache file even in a
+  preview run; `--refresh` already honored dry-run).
+- `_fetch_omdb` no longer caches OMDb's `200 + {"Response":"False"}` error
+  bodies (bad key / quota / transient miss), which used to pin a title to
+  `N/A` for the rest of a long sweep.
+- A non-numeric OMDb rating is coerced to `N/A` rather than leaking into the
+  folder suffix (e.g. `[IMDb high]`), which the suffix regex couldn't strip.
+- `get_mdl_rating` now tolerates a +/-1 year difference (matching
+  `get_mal_rating`) — K-dramas listed on MyDramaList one year off no longer
+  fall back to IMDb on a low title-similarity match.
+- `slugify` returns its documented `"unknown"` fallback for all-non-Latin
+  titles (Korean/Japanese/…) instead of an empty string.
+- A failed `desktop.ini` write re-applies System/Hidden to the original file,
+  so a transient write error can't leave a previously-hidden `desktop.ini`
+  visible as a plain file.
+- `rename_folder`'s merge-complete path now logs as `Renamed ...` so the sweep
+  summary counts merge-path renames (they were previously undercounted).
 
 ### Changed
 - `_fs_lock` docstring and contention warning corrected: the helper yields
   `acquired=False` for the caller to decide; the only current caller
   (`_process`) skips. Previous wording claimed "proceeding".
+- The OpenSubtitles API's `attributes.url` (the one fully upstream-controlled
+  string that reaches the generated `Subtitle.vbs`) is now constrained to the
+  `opensubtitles.com` domain before it's trusted — a compromised/malicious
+  endpoint can no longer plant an arbitrary URL the user opens by clicking the
+  shortcut.
+- `--force-refresh` is now threaded through `_process` as a parameter instead
+  of temporarily rebinding the module-level `_rating_cache_is_fresh` function.
+- `_redact` also strips `api_key`/`apikey` query-param values by name, covering
+  encoded/transformed keys it doesn't hold a verbatim copy of.
 
 ## [1.0.0] — 2026-05-16
 

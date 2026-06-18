@@ -37,6 +37,14 @@ except Exception:
 class ProviderUnavailable(Exception):
     pass
 
+# Raised when the Sonarr/Radarr library list itself cannot be fetched (service
+# down or bad API key) — as opposed to a folder simply not being in the
+# library. Lets the sweep distinguish "service unreachable" (abort, non-zero
+# exit) from "this folder is unknown" instead of silently miscounting an outage
+# as a library full of unknown folders.
+class ServiceUnavailable(Exception):
+    pass
+
 # ==========================
 # .env loader (no external dependency)
 # ==========================
@@ -80,6 +88,8 @@ ENABLE_CREATE_FOLDER_ICON   = True
 ENABLE_CREATE_SHORTCUTS     = True
 ENABLE_SET_TOOLTIP          = True
 ENABLE_GROUPED_LINKS_FOLDER = True
+ENABLE_HIDE_METADATA        = False  # Also hide .nfo + extra artwork in the folder
+                                     # (off by default; restores the old Creator.exe -h view)
 ENABLE_MDL_RATING           = True   # For Korean titles: use MDL rating (falls back to IMDb)
 ENABLE_MAL_RATING           = True   # For anime: use MAL rating (falls back to IMDb)
 FORCE_REGENERATE_SHORTCUTS  = False  # When True, delete + recreate all shortcuts on every run
@@ -278,15 +288,39 @@ def _is_safe_url(url):
         return False
     return True
 
+def _is_opensubtitles_url(url):
+    """True only for https URLs on the opensubtitles.com domain. The
+    OpenSubtitles API's attributes.url is fully upstream-controlled and is the
+    one third-party string that reaches the generated Subtitle.vbs, so constrain
+    it to the expected host (allowlist) before trusting it — a compromised or
+    malicious endpoint otherwise gets to plant any https URL the user later
+    opens by clicking the shortcut."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url or "")
+        host = (p.hostname or "").lower()
+        return p.scheme == "https" and (host == "opensubtitles.com"
+                                        or host.endswith(".opensubtitles.com"))
+    except Exception:
+        return False
+
 # ==========================
 # Log redaction
 # ==========================
+_SECRET_PARAM_RE = re.compile(r'(?i)\b(api[_-]?key)=([^&\s"\']+)')
+
 def _redact(s):
-    """Return s with known secrets replaced by '<redacted>'."""
+    """Return s with secrets replaced by '<redacted>'.
+
+    First strips api_key/apikey query-param values by name (robust to encoded
+    or otherwise-transformed keys we don't hold a verbatim copy of), then
+    replaces the exact configured key values as a backstop (covers header
+    values like X-Api-Key that don't use the param form)."""
     try:
         text = str(s)
     except Exception:
         return s
+    text = _SECRET_PARAM_RE.sub(r'\1=<redacted>', text)
     for secret in (OMDB_API_KEY, SUBDL_API_KEY, OPENSUBTITLES_API_KEY,
                    SONARR_API_KEY, RADARR_API_KEY):
         if secret and len(secret) > 3:
@@ -331,7 +365,9 @@ def slugify(value):
         value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
         value = re.sub(r'[^\w\s-]', '', value).strip().lower()
         value = re.sub(r'[-\s]+', '-', value)
-        return value
+        # NFKD+ASCII can empty an all-non-Latin title (Korean/Japanese/etc.) —
+        # honor the same "unknown" fallback used for empty/error input.
+        return value or "unknown"
     except Exception:
         return "unknown"
 
@@ -381,9 +417,11 @@ def get_opensubtitles_web_url(imdb_id, content_type="movie"):
         item = results[0]
         attr = item.get("attributes", {})
         
-        # OpenSubtitles often returns a direct URL in attributes
-        if attr.get("url"):
-            return attr.get("url")
+        # OpenSubtitles often returns a direct URL in attributes. Trust it only
+        # if it's on the opensubtitles.com domain — it's fully upstream-controlled.
+        api_url = attr.get("url")
+        if api_url and _is_opensubtitles_url(api_url):
+            return api_url
 
         # Fallback: Construct URL from slug if available
         # Web format: https://www.opensubtitles.com/en/movies/{year}-{slug}
@@ -409,7 +447,7 @@ def get_opensubtitles_web_url(imdb_id, content_type="movie"):
         return default_search
 
     except Exception as e:
-        log_err(f"OpenSubtitles API URL lookup failed: {e}")
+        log_err(f"OpenSubtitles API URL lookup failed: {_redact(e)}")
         return default_search
 
 
@@ -488,12 +526,16 @@ def _fetch_omdb(imdb_id):
         url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&i={quote(imdb_id)}&plot=short&r=json"
         r = http().get(url, timeout=15)
         if r.status_code != 200:
-            _omdb_response_cache[imdb_id] = {}
-            return {}
+            return {}   # transient — don't cache, allow a later retry
         data = r.json() or {}
     except Exception as e:
         log_debug(f"OMDb fetch failed: {_redact(e)}")
-        data = {}
+        return {}       # transient — don't cache
+    # OMDb returns HTTP 200 with {"Response":"False","Error":...} for bad/expired
+    # keys, exhausted quota, or transient lookup failures. Don't cache those —
+    # only a real answer should be memoized (a quota reset must be retryable).
+    if str(data.get("Response", "")).lower() == "false" or data.get("Error"):
+        return {}
     _omdb_response_cache[imdb_id] = data
     return data
 
@@ -602,12 +644,19 @@ def set_folder_tooltip(folder_path: str, tooltip: str) -> None:
                 os.remove(ini_path + ".tmp")
         except OSError:
             pass
+        # We cleared System/Hidden up front; re-apply them so a failed write
+        # doesn't leave a previously-hidden desktop.ini visible as a plain file.
+        if os.path.exists(ini_path):
+            _set_file_attrs(ini_path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_HIDDEN))
 
 def get_imdb_rating_from_omdb(imdb_id: str) -> str:
     val = (_fetch_omdb(imdb_id) or {}).get("imdbRating") or ""
     if val and val != "N/A":
         m = re.match(r"^(\d+(?:\.\d)?)", str(val))
-        return m.group(1) if m else str(val)
+        # A non-numeric value would escape into the folder suffix as e.g.
+        # "[IMDb high]", which _RATING_SUFFIX_RE can't strip and which defeats
+        # the sweep cache-skip — treat anything non-numeric as N/A.
+        return m.group(1) if m else "N/A"
     return "N/A"
 
 # IMDb's public GraphQL endpoint — returns live ratings (not OMDb-cached values,
@@ -669,7 +718,7 @@ def _provider_cache_key(title, year):
 # ==========================
 RATING_CACHE_PATH = os.path.join(SCRIPT_DIR, ".rating_cache.json")
 _rating_cache = None    # lazy-loaded
-_rating_cache_dirty = False  # flips True on _rating_cache_set
+_rating_cache_dirty_keys = set()  # keys this process changed since the last save
 
 def _load_rating_cache():
     global _rating_cache
@@ -686,18 +735,38 @@ def _load_rating_cache():
     return _rating_cache
 
 def _save_rating_cache():
-    """No-op if the cache hasn't been modified since last save (or load)."""
-    global _rating_cache_dirty
-    if _rating_cache is None or not _rating_cache_dirty:
+    """Persist this process's changes, merging with whatever is on disk so a
+    concurrent writer's entries aren't clobbered. No-op if nothing changed.
+
+    Sonarr/Radarr import several files in a burst, each in its own process; a
+    plain whole-file rewrite would let the last writer drop the others' entries
+    (correctness self-heals next sweep, but it defeats the warm-cache intent).
+    So re-read the on-disk cache and overlay only the keys WE touched."""
+    global _rating_cache, _rating_cache_dirty_keys
+    if _rating_cache is None or not _rating_cache_dirty_keys:
         return
     if DRY_RUN:
         return
+    try:
+        with open(RATING_CACHE_PATH, "r", encoding="utf-8") as f:
+            merged = json.load(f) or {}
+    except (FileNotFoundError, ValueError):
+        merged = {}
+    except OSError as e:
+        log_err(f"Could not re-read rating cache for merge: {e}")
+        merged = dict(_rating_cache)
+    for key in _rating_cache_dirty_keys:
+        if key in _rating_cache:
+            merged[key] = _rating_cache[key]
+        else:
+            merged.pop(key, None)   # we deleted this entry
     tmp = RATING_CACHE_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_rating_cache, f, indent=2, sort_keys=True)
+            json.dump(merged, f, indent=2, sort_keys=True)
         os.replace(tmp, RATING_CACHE_PATH)
-        _rating_cache_dirty = False
+        _rating_cache = merged          # adopt the merged view in-process
+        _rating_cache_dirty_keys = set()
     except Exception as e:
         log_err(f"Could not save rating cache: {e}")
         try:
@@ -733,7 +802,6 @@ def _rating_cache_is_fresh(imdb_id):
     return age_days < RATING_CACHE_TTL_DAYS
 
 def _rating_cache_set(imdb_id, rating, source):
-    global _rating_cache_dirty
     if not imdb_id:
         return
     cache = _load_rating_cache()
@@ -744,7 +812,7 @@ def _rating_cache_set(imdb_id, rating, source):
         "rating": rating,
         "source": source,
     }
-    _rating_cache_dirty = True
+    _rating_cache_dirty_keys.add(imdb_id)
 
 def get_mdl_rating(title: str, year=None):
     """
@@ -782,9 +850,21 @@ def get_mdl_rating(title: str, year=None):
             korean = [d for d in dramas if "korean" in (d.get("type") or "").lower()]
             candidates = korean or dramas
 
-            # Score each candidate by (year match, title similarity)
+            # Score each candidate by (year match, title similarity). Allow a
+            # +/-1 year tolerance (matches get_mal_rating): K-dramas often air
+            # across a year boundary or are listed on MDL one year off from the
+            # TVDB/TMDb year Sonarr/Radarr supplies.
             def score(d):
-                yr_ok = bool(year) and str(d.get("year") or "") == str(year)
+                try:
+                    cand_yr = int(str(d.get("year") or "")[:4])
+                except (TypeError, ValueError):
+                    cand_yr = None
+                try:
+                    want_yr = int(str(year)[:4]) if year else None
+                except (TypeError, ValueError):
+                    want_yr = None
+                yr_ok = (want_yr is not None and cand_yr is not None
+                         and abs(want_yr - cand_yr) <= 1)
                 sim = _title_similarity(d.get("title") or "", clean)
                 return (yr_ok, sim)
 
@@ -963,6 +1043,10 @@ def get_imdb_rating(imdb_id: str) -> str:
 # ==========================
 # Rename Folder
 # ==========================
+# The leading \s+ is deliberate: it distinguishes a real rating suffix from
+# legitimate bracketed text like "Show [Season 1]". A consequence is that a
+# hand-applied no-space suffix ("Show[IMDb 8.6]") is NOT recognized/stripped;
+# the tool always writes a space, so this only affects manual user renames.
 _RATING_SUFFIX_RE = re.compile(r'\s+\[(?:IMDb|MDL|MAL|TMDb|RT)\s*\d+(?:\.\d+)?\]$')
 
 def _strip_rating_suffix(name: str) -> str:
@@ -990,6 +1074,15 @@ def rename_folder(old_path, rating, source="IMDb"):
     if not os.path.exists(old_path):
         log_err(f"Rename skipped: source path not found ({old_path})")
         return new_path if os.path.exists(new_path) else old_path
+
+    if DRY_RUN:
+        # Predict the outcome WITHOUT touching disk. This must come before the
+        # merge branch below, which performs real shutil.move/os.remove/rmtree.
+        if os.path.exists(new_path):
+            log(f"[DRY RUN] Destination exists; would merge {old_path} -> {new_path}")
+        else:
+            log(f"[DRY RUN] Would rename {old_path} -> {new_path}")
+        return new_path
 
     if os.path.exists(new_path):
         log(f"Destination exists ({new_path}). Attempting merge...")
@@ -1030,7 +1123,9 @@ def rename_folder(old_path, rating, source="IMDb"):
                 return new_path
             try:
                 shutil.rmtree(old_path)
-                log(f"Merge complete. Removed source: {old_path}")
+                # Logged as "Renamed ..." (not just "Merge complete") so the
+                # sweep's _EventCounter counts merge-path renames too.
+                log(f"Renamed {old_path} -> {new_path} (merge complete, source removed)")
                 return new_path
             except OSError as e:
                 log_err(f"Could not remove source folder: {e}")
@@ -1038,10 +1133,6 @@ def rename_folder(old_path, rating, source="IMDb"):
         except Exception as e:
             log_err(f"Merge failed: {e}")
             return old_path
-
-    if DRY_RUN:
-        log(f"[DRY RUN] Would rename {old_path} -> {new_path}")
-        return new_path
 
     # Use os.rename (atomic on same-drive NTFS) instead of shutil.move.
     # shutil.move falls back to copy+delete when the rename fails, which
@@ -1245,6 +1336,10 @@ def _apply_icon_to_desktop_ini(folder_path):
                 os.remove(tmp_path)
         except OSError:
             pass
+        # Re-apply System/Hidden (cleared up front) so a failed write doesn't
+        # leave a previously-hidden desktop.ini visible as a plain file.
+        if os.path.exists(ini_path):
+            _set_file_attrs(ini_path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_HIDDEN))
         return False
 
 def _bind_folder_icon(folder_path, icon_filename=_ICON_NAME):
@@ -1304,6 +1399,23 @@ def _refresh_icon_cache():
     except Exception as e:
         log_debug(f"Icon cache refresh failed: {e}")
 
+# Metadata sidecars hidden when ENABLE_HIDE_METADATA is True. Top level only,
+# never recursive, never touches media files.
+_METADATA_HIDE_NAMES = (".nfo", "fanart.jpg", "banner.jpg", "clearlogo.png",
+                        "logo.png", "landscape.jpg", "clearart.png", "disc.png",
+                        "poster.jpg", "thumb.jpg")
+
+def _hide_metadata_files(folder_path):
+    """Best-effort: set HIDDEN on common Sonarr/Radarr metadata sidecars (.nfo +
+    extra artwork) in the top of the folder. Restores the cleaner Explorer view
+    the old Creator.exe `-h` produced; opt-in via ENABLE_HIDE_METADATA."""
+    try:
+        for name in os.listdir(folder_path):
+            if name.lower().endswith(_METADATA_HIDE_NAMES):
+                _set_file_attrs(os.path.join(folder_path, name), add=_FILE_ATTRIBUTE_HIDDEN)
+    except OSError as e:
+        log_debug(f"Metadata hide skipped for {folder_path}: {e}")
+
 def create_folder_icon(path):
     if not ENABLE_CREATE_FOLDER_ICON:
         return
@@ -1334,6 +1446,8 @@ def create_folder_icon(path):
         # Windows to honor desktop.ini at all.
         _set_file_attrs(poster, add=_FILE_ATTRIBUTE_HIDDEN)
         _set_file_attrs(ico, add=_FILE_ATTRIBUTE_HIDDEN)
+        if ENABLE_HIDE_METADATA:
+            _hide_metadata_files(path)
         _set_file_attrs(path, add=(_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_READONLY))
         _bind_folder_icon(path)
         _refresh_icon_cache()
@@ -1595,8 +1709,11 @@ def get_object_by_path(service, path):
             response.raise_for_status()
             _library_cache[service] = response.json() or []
         except Exception as e:
-            log_err(f"{service.capitalize()} list error: {e}")
-            return None
+            log_err(f"{service.capitalize()} list error: {_redact(e)}")
+            # Distinguish "service unreachable" from "folder not in library":
+            # callers (esp. the sweep) must not treat an outage as a library of
+            # unknown folders. Not cached, so a later call can still succeed.
+            raise ServiceUnavailable(f"{service} library fetch failed: {e}") from e
     data = _library_cache[service]
 
     def _normalize(p):
@@ -1868,27 +1985,38 @@ def _apply_content_class_tiebreaker(service, obj_id, path, is_anime, is_korean,
             is_korean = True
     return is_anime, is_korean
 
-def _process(service, path):
+def _process(service, path, force_refresh=False):
     """Shared post-import flow for Sonarr/Radarr."""
     cfg = _SERVICE_ADAPTERS[service]
     imdb     = os.environ.get(cfg["imdb_env"])
     other_id = os.environ.get(cfg["other_id_env"])
     title    = os.environ.get(cfg["title_env"], "")
+    env_obj_id = os.environ.get(cfg["id_env"])
+
+    # Sweep freshness cache key: prefer the IMDb id, but fall back to
+    # service+id so anime/K-drama titles that lack an IMDb id are still cached
+    # and skipped on the next sweep (otherwise they re-hit Jikan/kuryana nightly).
+    rating_key = imdb or (f"{service}:{env_obj_id}" if env_obj_id else "")
 
     # Sweep mode: skip if rating was checked recently AND the folder still
     # has a rating suffix. If the suffix is missing (no rating yet, or user
-    # stripped it manually), re-check regardless of cache age.
-    if (RATING_ONLY and imdb
+    # stripped it manually), re-check regardless of cache age. --force-refresh
+    # bypasses the freshness check entirely.
+    if (RATING_ONLY and rating_key and not force_refresh
             and _has_rating_suffix(os.path.basename(path))
-            and _rating_cache_is_fresh(imdb)):
+            and _rating_cache_is_fresh(rating_key)):
         log_debug(f"Cache fresh, skipping {title or path}")
         return
 
     log(f"{cfg['label']} post-import: {title or path}")
 
-    obj_id = os.environ.get(cfg["id_env"])
+    obj_id = env_obj_id
     if not obj_id:
-        obj_pre = get_object_by_path(service, path)
+        try:
+            obj_pre = get_object_by_path(service, path)
+        except ServiceUnavailable as e:
+            log_err(f"{cfg['label']} lookup failed: {_redact(e)}")
+            obj_pre = None
         obj_id = (obj_pre or {}).get("id")
 
     lock_key = f"{service}_{obj_id or re.sub(r'\\W+', '_', title or 'unknown')}"
@@ -1928,25 +2056,46 @@ def _process(service, path):
             provider_failed = True          # also skips tooltip rewrite below
         target_suffix = f" [{source} {rating}]"
 
+        # Only mark the rating "checked" in the cache once it actually commits
+        # to disk (and the service). A rolled-back or failed rename must NOT be
+        # cached, or the next sweep would skip retrying the folder for the whole
+        # TTL — silently defeating the rollback's purpose.
+        committed = (rating != "N/A")
         if rating != "N/A" and ENABLE_RENAME_FOLDER and not os.path.basename(path).endswith(target_suffix):
             new_path = rename_folder(path, rating, source)
             renamed = (os.path.abspath(new_path) != os.path.abspath(path)
                        and os.path.exists(new_path))
-            if renamed and ENABLE_UPDATE_SERVICE_PATH:
+            # If rename_folder took the merge branch but couldn't finish (the
+            # source folder still exists), a rollback's os.rename onto the
+            # still-present old_path would fail — so skip the API-update/rollback
+            # dance entirely and leave it for the next run.
+            merge_incomplete = renamed and os.path.exists(path)
+            if renamed and not merge_incomplete and ENABLE_UPDATE_SERVICE_PATH:
                 rid = obj_id
                 if not rid:
-                    obj = get_object_by_path(service, new_path)
+                    # _library_cache is keyed on PRE-rename paths, so look up the
+                    # old path (still in `path`), not new_path.
+                    try:
+                        obj = get_object_by_path(service, path)
+                    except ServiceUnavailable:
+                        obj = None
                     rid = (obj or {}).get("id")
                 api_ok = cfg["update_path"](rid, new_path) if rid else False
                 if not api_ok:
+                    committed = False
                     # Roll back so disk and service stay in sync
                     if rollback_rename(new_path, path):
                         new_path = path  # use old path for subsequent steps
+            elif merge_incomplete:
+                committed = False  # disk has both folders; retry next run
+            elif not renamed and not DRY_RUN:
+                committed = False  # rename didn't take effect; don't cache
             path = new_path
 
-        # Always remember when we last checked, so the next sweep can skip us
-        if rating != "N/A":
-            _rating_cache_set(imdb, rating, source)
+        # Remember when we last checked (only on a committed change) so the
+        # next sweep can skip us.
+        if rating != "N/A" and committed:
+            _rating_cache_set(rating_key, rating, source)
 
         # Sweep mode stops here — webhook continues with icon/shortcuts/tooltip
         if RATING_ONLY:
@@ -1970,11 +2119,11 @@ def _process(service, path):
                 tip = f"{plot}  [{source} {rating}]" if rating != "N/A" else plot
                 set_folder_tooltip(path, tip)
 
-def process_sonarr(path):
-    return _process("sonarr", path)
+def process_sonarr(path, force_refresh=False):
+    return _process("sonarr", path, force_refresh=force_refresh)
 
-def process_radarr(path):
-    return _process("radarr", path)
+def process_radarr(path, force_refresh=False):
+    return _process("radarr", path, force_refresh=force_refresh)
 
 # ==========================
 # --validate
@@ -2089,8 +2238,11 @@ def validate_config():
 # ==========================
 # --sweep
 # ==========================
-def _sweep_one(service, path):
-    """Populate env vars from service API and invoke process_<service>(path)."""
+def _sweep_one(service, path, force_refresh=False):
+    """Populate env vars from service API and invoke process_<service>(path).
+
+    Propagates ServiceUnavailable from get_object_by_path so the caller can
+    tell a down service apart from a folder that simply isn't in the library."""
     obj = get_object_by_path(service, path)
     if not obj:
         return False  # service doesn't know about this folder
@@ -2111,7 +2263,7 @@ def _sweep_one(service, path):
             set_env("Sonarr_Series_Year", obj.get("year") or "")
             set_env("Sonarr_OriginalLanguage", lang)
             set_env("Sonarr_Series_Type", obj.get("seriesType") or "")
-            process_sonarr(path)
+            process_sonarr(path, force_refresh=force_refresh)
         else:
             lang = (obj.get("originalLanguage") or {}).get("name", "")
             set_env("Radarr_Movie_Id", obj.get("id"))
@@ -2120,7 +2272,7 @@ def _sweep_one(service, path):
             set_env("Radarr_Movie_Title", obj.get("title") or "")
             set_env("Radarr_Movie_Year", obj.get("year") or "")
             set_env("Radarr_Movie_OriginalLanguage", lang)
-            process_radarr(path)
+            process_radarr(path, force_refresh=force_refresh)
         return True
     finally:
         for k, v in saved.items():
@@ -2146,11 +2298,9 @@ def _parse_roots_arg(values):
 
 # No hardcoded fallback — too easy to ship the original author's drive layout.
 # When neither --roots, ARR_FINISHER_SWEEP_ROOTS, nor service auto-discovery
-# yields anything, the sweep will refuse to run and tell the user to configure.
-_HARDCODED_FALLBACK_ROOTS = []
-
-# Backward-compat alias (other code/users may reference this constant).
-DEFAULT_SWEEP_ROOTS = _HARDCODED_FALLBACK_ROOTS
+# yields anything, the sweep refuses to run and tells the user to configure.
+# Kept as a public, documented constant for external importers.
+DEFAULT_SWEEP_ROOTS = []
 
 def _discover_sweep_roots():
     """Query Sonarr and Radarr for their configured root folders, returning
@@ -2238,13 +2388,9 @@ def sweep_library(roots=None, force_refresh=False):
     prev_rating_only = RATING_ONLY
     RATING_ONLY = True
 
-    # --force-refresh: pretend every cache entry is stale by temporarily
-    # replacing the freshness check. Restored in `finally` below.
-    fresh_check_orig = None
     if force_refresh:
-        global _rating_cache_is_fresh
-        fresh_check_orig = _rating_cache_is_fresh
-        _rating_cache_is_fresh = lambda imdb_id: False  # noqa: E731
+        # Threaded through _sweep_one -> process_* -> _process, which bypasses
+        # the freshness check when force_refresh is set.
         log("Sweep: --force-refresh — treating every entry as stale")
 
     # Attach a counter to tally events during the sweep. Attached to our named
@@ -2256,6 +2402,7 @@ def sweep_library(roots=None, force_refresh=False):
 
     start_ts = time.time()
     processed = skipped = unknown = 0
+    had_service_error = False
     try:
         for root, service in roots:
             if not os.path.isdir(root):
@@ -2267,19 +2414,25 @@ def sweep_library(roots=None, force_refresh=False):
                 if not os.path.isdir(sub) or entry.startswith("."):
                     continue
                 try:
-                    if _sweep_one(service, sub):
+                    if _sweep_one(service, sub, force_refresh=force_refresh):
                         processed += 1
                     else:
                         unknown += 1
                         log(f"Sweep: {service} doesn't know {sub}")
+                except ServiceUnavailable as e:
+                    # The service is down/unauthenticated — every folder in this
+                    # root would fail identically. Abort the root rather than
+                    # mislabeling the whole library as "unknown", and fail loud
+                    # (non-zero exit) so a scheduled sweep doesn't look green.
+                    log_err(f"Sweep: {service} unreachable, skipping rest of {root}: {_redact(e)}")
+                    had_service_error = True
+                    break
                 except Exception as e:
                     skipped += 1
                     log_err(f"Sweep: error processing {sub}: {e}")
     finally:
         arr_logger.removeHandler(counter)
         RATING_ONLY = prev_rating_only
-        if fresh_check_orig is not None:
-            _rating_cache_is_fresh = fresh_check_orig
         _save_rating_cache()
 
     elapsed = time.time() - start_ts
@@ -2290,7 +2443,7 @@ def sweep_library(roots=None, force_refresh=False):
         f"{c['mal_rejected']+c['mdl_rejected']} rejected, {c['rollbacks']} rollback(s), "
         f"{c['provider_outage']} provider outage(s)"
     )
-    return 0
+    return 1 if had_service_error else 0
 
 def regenerate_shortcuts(roots=None):
     """Walk library roots and rebuild every Links/ shortcut from current code.
@@ -2313,6 +2466,7 @@ def regenerate_shortcuts(roots=None):
     FORCE_REGENERATE_SHORTCUTS = True
     start_ts = time.time()
     processed = unknown = errored = 0
+    had_service_error = False
     try:
         for root, service in roots:
             if not os.path.isdir(root):
@@ -2353,6 +2507,10 @@ def regenerate_shortcuts(roots=None):
                         create_shortcuts("radarr", sub, imdb_id, tmdb_id, title,
                                          is_korean=is_korean, is_anime=is_anime, year=year)
                     processed += 1
+                except ServiceUnavailable as e:
+                    log_err(f"Regen: {service} unreachable, skipping rest of {root}: {_redact(e)}")
+                    had_service_error = True
+                    break
                 except Exception as e:
                     errored += 1
                     log_err(f"Regen: error processing {sub}: {e}")
@@ -2360,11 +2518,14 @@ def regenerate_shortcuts(roots=None):
         FORCE_REGENERATE_SHORTCUTS = prev_force
     log(f"Regen complete: {processed} processed, {unknown} unknown, "
         f"{errored} errored in {time.time()-start_ts:.1f}s")
-    return 0
+    return 1 if had_service_error else 0
 
 def clear_rating_cache(imdb_id=None):
     """Delete the on-disk rating cache (or just one entry if imdb_id is given)."""
     if not imdb_id:
+        if DRY_RUN:
+            log(f"[DRY RUN] Would clear rating cache: {RATING_CACHE_PATH}")
+            return 0
         try:
             os.remove(RATING_CACHE_PATH)
             log(f"Cleared rating cache: {RATING_CACHE_PATH}")
@@ -2375,16 +2536,41 @@ def clear_rating_cache(imdb_id=None):
             return 1
         return 0
     # Single-entry refresh
-    global _rating_cache_dirty
     cache = _load_rating_cache()
     if imdb_id in cache:
         del cache[imdb_id]
-        _rating_cache_dirty = True
+        _rating_cache_dirty_keys.add(imdb_id)
         _save_rating_cache()
         log(f"Removed rating cache entry for {imdb_id}")
     else:
         log(f"No rating cache entry for {imdb_id}")
     return 0
+
+def check_rollbacks():
+    """Scan .rollbacks.log for unresolved FAIL entries — the disk/service desync
+    that needs manual fixup — and print them. Returns 1 if any are found, else 0.
+    Folds the 'grep .rollbacks.log periodically' chore into a real command."""
+    if not os.path.exists(_ROLLBACK_MARKER_PATH):
+        print(f"No {os.path.basename(_ROLLBACK_MARKER_PATH)} — nothing to check.")
+        return 0
+    fails = []
+    try:
+        with open(_ROLLBACK_MARKER_PATH, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # marker format: "[ts] FAIL disk=... service_expects=... err=..."
+                if re.search(r"\]\s*FAIL\b", line):
+                    fails.append(line.rstrip("\n"))
+    except OSError as e:
+        log_err(f"Could not read {_ROLLBACK_MARKER_PATH}: {e}")
+        return 1
+    if not fails:
+        print(f"No FAIL entries in {_ROLLBACK_MARKER_PATH} — disk and service are in sync.")
+        return 0
+    print(f"\n{len(fails)} unresolved rollback FAILURE(s) in {_ROLLBACK_MARKER_PATH}:")
+    print("(disk and Sonarr/Radarr are out of sync — manual fixup needed)\n")
+    for line in fails:
+        print(f"  {line}")
+    return 1
 
 # ==========================
 # Setup-help sidecar
@@ -2467,6 +2653,9 @@ def main():
     parser.add_argument("--refresh", metavar="IMDB_ID",
                         help="Remove a single IMDb ID from the rating cache and exit "
                              "(next sweep will re-fetch it).")
+    parser.add_argument("--check-rollbacks", action="store_true",
+                        help="Scan .rollbacks.log for unresolved FAIL entries "
+                             "(disk/service desync) and exit non-zero if any are found.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable DEBUG-level logging (idempotent 'Already exists' etc.).")
     parser.add_argument("--version", action="version", version=f"arr_finisher {__version__}")
@@ -2498,6 +2687,8 @@ def main():
         return clear_rating_cache()
     if args.refresh:
         return clear_rating_cache(args.refresh)
+    if args.check_rollbacks:
+        return check_rollbacks()
     if args.validate:
         return validate_config()
 
@@ -2529,7 +2720,12 @@ def main():
         # Manual mode: route through _sweep_one so env vars get populated from
         # the service API (title, imdb_id, year, language). Without this the
         # process_*() functions see empty fields and silently do nothing.
-        if not _sweep_one(args.service, args.path):
+        try:
+            known = _sweep_one(args.service, args.path)
+        except ServiceUnavailable as e:
+            log_err(f"{args.service} unreachable: {_redact(e)}")
+            return 1
+        if not known:
             log_err(f"{args.service} doesn't know about {args.path}")
             return 1
         _save_rating_cache()

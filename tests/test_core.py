@@ -1240,7 +1240,7 @@ class TestRatingCacheDirtyFlag:
         before_mtime = cache_path.stat().st_mtime_ns
         monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_path))
         monkeypatch.setattr(f, "_rating_cache", None)
-        monkeypatch.setattr(f, "_rating_cache_dirty", False)
+        monkeypatch.setattr(f, "_rating_cache_dirty_keys", set())
         # Force a lazy load (mark cache as loaded but not dirty)
         f._load_rating_cache()
         f._save_rating_cache()
@@ -1251,7 +1251,7 @@ class TestRatingCacheDirtyFlag:
         cache_path = tmp_path / ".rating_cache.json"
         monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_path))
         monkeypatch.setattr(f, "_rating_cache", {})
-        monkeypatch.setattr(f, "_rating_cache_dirty", False)
+        monkeypatch.setattr(f, "_rating_cache_dirty_keys", set())
         f._rating_cache_set("tt99", "8.4", "IMDb")
         f._save_rating_cache()
         assert cache_path.exists()
@@ -1480,3 +1480,518 @@ class TestForceRebuildPreservesTooltip:
         f.create_folder_icon(str(folder))
         text = ini.read_bytes().decode("utf-16")
         assert "InfoTip=" not in text, "No tooltip should be invented from nothing"
+
+
+# ==========================================================================
+# Review fixes (this pass)
+# ==========================================================================
+from contextlib import contextmanager
+
+
+# ---------- B1: --dry-run must not mutate via the merge branch ----------
+
+class TestDryRunMerge:
+    def test_dry_run_does_not_merge_existing_destination(self, staging, monkeypatch):
+        # Regression: the merge branch (shutil.move/rmtree) used to run BEFORE
+        # the DRY_RUN check, so a preview run could move files and delete the
+        # source folder when the rated-name destination already existed.
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        open(os.path.join(old, "ep.mkv"), "w").write("keep")
+
+        ret = f.rename_folder(old, "8.0", "IMDb")
+
+        assert ret == new                       # predicts the destination
+        assert os.path.isdir(old)               # source untouched
+        assert os.path.isfile(os.path.join(old, "ep.mkv"))
+        assert not os.path.isfile(os.path.join(new, "ep.mkv"))  # nothing moved
+
+
+# ---------- B2: rating cache only written when the change commits ----------
+
+class TestCacheCommitGating:
+    def test_rolled_back_rename_does_not_cache(self, staging, make_series,
+                                               patch_providers, monkeypatch, clear_env_vars):
+        folder = make_series("Cache RB (2025) [IMDb 7.0]")
+        patch_providers["mdl_rating"] = ("8.5", "MDL")
+        patch_providers["sonarr_put_ok"] = False        # API rejects → rollback
+        monkeypatch.setattr(f, "_rating_cache", {})
+        monkeypatch.setattr(f, "_rating_cache_dirty_keys", set())
+        os.environ.update({
+            "Sonarr_Series_Id": "1", "Sonarr_Series_ImdbId": "ttrb",
+            "Sonarr_Series_Title": "Cache RB (2025)", "Sonarr_Series_Year": "2025",
+            "Sonarr_OriginalLanguage": "Korean",
+        })
+        f.process_sonarr(folder)
+        assert os.path.isdir(folder)                     # rolled back to old name
+        assert "ttrb" not in f._load_rating_cache()      # NOT cached → retried next sweep
+
+    def test_committed_rename_is_cached(self, staging, make_series,
+                                        patch_providers, monkeypatch, clear_env_vars):
+        folder = make_series("Cache OK (2025) [IMDb 7.0]")
+        patch_providers["mdl_rating"] = ("8.5", "MDL")
+        patch_providers["sonarr_put_ok"] = True
+        monkeypatch.setattr(f, "_rating_cache", {})
+        monkeypatch.setattr(f, "_rating_cache_dirty_keys", set())
+        os.environ.update({
+            "Sonarr_Series_Id": "1", "Sonarr_Series_ImdbId": "ttok",
+            "Sonarr_Series_Title": "Cache OK (2025)", "Sonarr_Series_Year": "2025",
+            "Sonarr_OriginalLanguage": "Korean",
+        })
+        f.process_sonarr(folder)
+        assert os.path.isdir(os.path.join(staging, "Cache OK (2025) [MDL 8.5]"))
+        assert "ttok" in f._load_rating_cache()
+
+
+# ---------- B3: service outage is distinguished from "unknown folder" ----------
+
+class TestServiceUnavailable:
+    def test_get_object_raises_on_fetch_error(self, monkeypatch):
+        class _S:
+            @staticmethod
+            def get(*a, **k):
+                raise ConnectionError("down")
+        monkeypatch.setattr(f, "http", lambda: _S())
+        monkeypatch.setattr(f, "_library_cache", {})
+        with pytest.raises(f.ServiceUnavailable):
+            f.get_object_by_path("sonarr", r"D:\TV\Foo")
+
+    def test_sweep_returns_nonzero_on_outage(self, staging, make_series, monkeypatch, tmp_path):
+        make_series("Show A (2024)")
+        make_series("Show B (2024)")
+        def boom(svc, p):
+            raise f.ServiceUnavailable("sonarr down")
+        monkeypatch.setattr(f, "get_object_by_path", boom)
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(tmp_path / ".rating_cache.json"))
+        rc = f.sweep_library([f"{staging}:sonarr"])
+        assert rc == 1   # outage → non-zero, not a falsely-green "all unknown" run
+
+    def test_manual_mode_returns_nonzero_on_outage(self, staging, make_series, monkeypatch):
+        folder = make_series("Solo (2024)")
+        def boom(svc, p):
+            raise f.ServiceUnavailable("radarr down")
+        monkeypatch.setattr(f, "get_object_by_path", boom)
+        monkeypatch.setattr("sys.argv",
+                            ["arr_finisher.py", "--service", "radarr", "--path", folder])
+        rc = f.main()
+        assert rc == 1
+
+
+# ---------- B4: concurrent cache writers don't clobber each other ----------
+
+class TestCacheConcurrentMerge:
+    def test_save_merges_external_entries(self, monkeypatch, tmp_path):
+        cache_path = tmp_path / ".rating_cache.json"
+        # Simulate another process having already written an entry.
+        cache_path.write_text(
+            '{"tt_other":{"checked_at":"2026-01-01T00:00:00","rating":"5.0","source":"IMDb"}}')
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_path))
+        monkeypatch.setattr(f, "_rating_cache", {})
+        monkeypatch.setattr(f, "_rating_cache_dirty_keys", set())
+        f._rating_cache_set("tt_mine", "8.0", "IMDb")
+        f._save_rating_cache()
+        import json as _json
+        merged = _json.loads(cache_path.read_text())
+        assert "tt_mine" in merged    # our entry persisted
+        assert "tt_other" in merged   # concurrent writer's entry preserved
+
+
+# ---------- B5: --clear-cache respects --dry-run ----------
+
+class TestClearCacheDryRun:
+    def test_dry_run_keeps_file(self, monkeypatch, tmp_path):
+        cache_path = tmp_path / ".rating_cache.json"
+        cache_path.write_text("{}")
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(cache_path))
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        assert f.clear_rating_cache() == 0
+        assert cache_path.exists()
+
+
+# ---------- B6: merge-incomplete must skip the API update/rollback dance ----------
+
+class TestMergeIncompleteNoApiUpdate:
+    def test_no_service_update_when_merge_incomplete(self, staging, make_series,
+                                                     patch_providers, monkeypatch, clear_env_vars):
+        old = make_series("Conflict (2024)", files=("ep.mkv",))
+        new = old + " [IMDb 8.0]"
+        os.makedirs(new)
+        open(os.path.join(new, "ep.mkv"), "w").write("dest-version")   # forces merge-incomplete
+        patch_providers["imdb_rating"] = "8.0"
+        calls = {"n": 0}
+        monkeypatch.setattr(f, "sonarr_update_path_via_put",
+                            lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or True)
+        os.environ.update({
+            "Sonarr_Series_Id": "1", "Sonarr_Series_ImdbId": "ttmi",
+            "Sonarr_Series_Title": "Conflict (2024)", "Sonarr_Series_Year": "2024",
+            "Sonarr_OriginalLanguage": "English",
+        })
+        f.process_sonarr(old)
+        assert calls["n"] == 0          # no doomed API update / rollback attempted
+        assert os.path.isdir(old)       # source left for manual resolution
+        assert os.path.isdir(new)
+
+
+# ---------- B7: failed desktop.ini write re-hides the original ----------
+
+class TestTooltipAttrRestore:
+    def test_failed_write_rehides_existing_ini(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(f, "ENABLE_SET_TOOLTIP", True)
+        folder = tmp_path / "show"
+        folder.mkdir()
+        ini = folder / "desktop.ini"
+        ini.write_bytes("[.ShellClassInfo]\r\nInfoTip=old\r\n".encode("utf-16"))
+
+        def _boom(*a, **k):
+            raise OSError("replace failed")
+        monkeypatch.setattr(f.os, "replace", _boom)
+        calls = []
+        orig = f._set_file_attrs
+        def spy(path, add=0, remove=0):
+            calls.append((str(path), add, remove))
+            return orig(path, add=add, remove=remove)
+        monkeypatch.setattr(f, "_set_file_attrs", spy)
+
+        f.set_folder_tooltip(str(folder), "new tip")   # must not raise
+        rehide = [c for c in calls
+                  if c[0] == str(ini)
+                  and (c[1] & (f._FILE_ATTRIBUTE_SYSTEM | f._FILE_ATTRIBUTE_HIDDEN))]
+        assert rehide, "desktop.ini should be re-hidden after a failed write"
+
+
+# ---------- B8: slugify falls back to 'unknown' for empty results ----------
+
+class TestSlugifyFallback:
+    def test_non_ascii_title_returns_unknown(self):
+        assert f.slugify("진격의 거인") == "unknown"
+        assert f.slugify("!!!") == "unknown"
+
+    def test_ascii_title_slugified(self):
+        assert f.slugify("The Boys") == "the-boys"
+
+
+# ---------- I3: OMDb 200+Response:False error bodies are not cached ----------
+
+class TestOmdbErrorNotCached:
+    def test_response_false_not_cached(self, monkeypatch):
+        calls = {"n": 0}
+        def fake_get(url, timeout=15):
+            calls["n"] += 1
+            class _R:
+                status_code = 200
+                def json(self_): return {"Response": "False", "Error": "Invalid API key!"}
+            return _R()
+        monkeypatch.setattr(f, "OMDB_API_KEY", "fake")
+        monkeypatch.setattr(f, "_omdb_response_cache", {})
+        monkeypatch.setattr(f, "http", lambda: type("S", (), {"get": staticmethod(fake_get)})())
+        assert f._fetch_omdb("tt1") == {}
+        assert f._fetch_omdb("tt1") == {}
+        assert calls["n"] == 2   # transient error not cached → retried
+
+
+# ---------- S3: non-numeric OMDb rating coerced to N/A ----------
+
+class TestOmdbNonNumeric:
+    def test_non_numeric_becomes_na(self, monkeypatch):
+        monkeypatch.setattr(f, "_fetch_omdb", lambda _id: {"imdbRating": "high"})
+        assert f.get_imdb_rating_from_omdb("tt1") == "N/A"
+
+    def test_numeric_extracted(self, monkeypatch):
+        monkeypatch.setattr(f, "_fetch_omdb", lambda _id: {"imdbRating": "8.6"})
+        assert f.get_imdb_rating_from_omdb("tt1") == "8.6"
+
+
+# ---------- S1: OpenSubtitles attributes.url constrained to its domain ----------
+
+class TestOpenSubtitlesAllowlist:
+    def test_host_allowlist(self):
+        assert f._is_opensubtitles_url("https://www.opensubtitles.com/en/movies/x")
+        assert f._is_opensubtitles_url("https://opensubtitles.com/x")
+        assert not f._is_opensubtitles_url("https://evil.example/x")
+        assert not f._is_opensubtitles_url("http://www.opensubtitles.com/x")   # not https
+        assert not f._is_opensubtitles_url("https://opensubtitles.com.evil.net/x")
+
+    def test_off_domain_api_url_falls_back(self, monkeypatch):
+        monkeypatch.setattr(f, "OPENSUBTITLES_API_KEY", "fake")
+        def fake_get(url, params=None, headers=None, timeout=20):
+            class _R:
+                status_code = 200
+                def raise_for_status(self_): pass
+                def json(self_):
+                    return {"data": [{"attributes": {"url": "https://evil.example/phish"}}]}
+            return _R()
+        monkeypatch.setattr(f, "http", lambda: type("S", (), {"get": staticmethod(fake_get)})())
+        url = f.get_opensubtitles_web_url("tt0111161", "movie")
+        assert "evil.example" not in url
+        assert "opensubtitles.com" in url   # fell back to a safe search URL
+
+
+# ---------- D5: MDL year match tolerates +/-1 (matches MAL) ----------
+
+class TestMdlYearTolerance:
+    def test_year_off_by_one_still_matches(self, monkeypatch):
+        def fake_get(url, timeout=15):
+            class _R:
+                status_code = 200
+                def json(self_):
+                    return {"results": {"dramas": [
+                        {"title": "Some Drama", "year": "2025", "type": "Korean Drama",
+                         "rating": "8.0", "slug": "1-some-drama"}]}}
+            return _R()
+        monkeypatch.setattr(f, "http", lambda: type("S", (), {"get": staticmethod(fake_get)})())
+        # Requested 2024, MDL lists 2025 — within +/-1, so a low-similarity title
+        # is still accepted (old exact-match logic would have rejected it).
+        assert f.get_mdl_rating("Totally Different Title", year="2024") == ("8.0", "MDL")
+
+
+# ---------- D1: merge-path renames are counted by _EventCounter ----------
+
+class TestMergeRenameCounted:
+    def test_merge_complete_logs_renamed(self, staging):
+        import logging as _logging
+        old = os.path.join(staging, "Show (2024)")
+        new = os.path.join(staging, "Show (2024) [IMDb 8.0]")
+        os.makedirs(old); os.makedirs(new)
+        open(os.path.join(old, "ep.mkv"), "w").write("x")   # clean merge, source removed
+        counter = f._EventCounter()
+        logger = _logging.getLogger(f.LOGGER_NAME)
+        logger.addHandler(counter)
+        try:
+            f.rename_folder(old, "8.0", "IMDb")
+        finally:
+            logger.removeHandler(counter)
+        assert counter.counts["renamed"] == 1
+
+
+# ---------- D3 / I2: sweep --force-refresh re-rates a fresh-cached folder ----------
+
+class TestSweepForceRefresh:
+    def test_force_refresh_reprocesses_fresh_folder(self, staging, make_series,
+                                                    patch_providers, monkeypatch, tmp_path):
+        import time as _t
+        folder = make_series("Boys (2019) [IMDb 8.0]")
+        patch_providers["imdb_rating"] = "8.6"
+        fake_obj = {"id": 1, "imdbId": "ttforce", "tvdbId": 1, "title": "Boys (2019)",
+                    "year": 2019, "originalLanguage": {"name": "English"}, "seriesType": "standard"}
+        monkeypatch.setattr(f, "get_object_by_path", lambda svc, p: fake_obj)
+        monkeypatch.setattr(f, "RATING_CACHE_PATH", str(tmp_path / ".rating_cache.json"))
+        monkeypatch.setattr(f, "_rating_cache",
+                            {"ttforce": {"checked_at": _t.time(), "rating": "8.0", "source": "IMDb"}})
+        monkeypatch.setattr(f, "_rating_cache_dirty_keys", set())
+        before_fn = f._rating_cache_is_fresh
+
+        # Fresh cache + no force → skipped, folder not renamed.
+        assert f.sweep_library([f"{staging}:sonarr"], force_refresh=False) == 0
+        assert os.path.isdir(folder)
+
+        # force_refresh → re-rated despite fresh cache.
+        assert f.sweep_library([f"{staging}:sonarr"], force_refresh=True) == 0
+        assert os.path.isdir(os.path.join(staging, "Boys (2019) [IMDb 8.6]"))
+        # The freshness function is threaded as a param now — never swapped out.
+        assert f._rating_cache_is_fresh is before_fn
+
+
+# ---------- I2: Radarr end-to-end flow ----------
+
+class TestRadarrProcess:
+    def test_movie_renamed_with_letterboxd_and_tvtime(self, staging, make_series,
+                                                      patch_providers, clear_env_vars):
+        folder = make_series("Inception (2010)", files=("movie.mkv",))
+        patch_providers["imdb_rating"] = "8.8"
+        os.environ.update({
+            "Radarr_Movie_Id": "10", "Radarr_Movie_ImdbId": "ttincept",
+            "Radarr_Movie_TmdbId": "27205", "Radarr_Movie_Title": "Inception (2010)",
+            "Radarr_Movie_Year": "2010", "Radarr_Movie_OriginalLanguage": "English",
+        })
+        f.process_radarr(folder)
+        new = folder + " [IMDb 8.8]"
+        assert os.path.isdir(new)
+        assert os.path.isfile(os.path.join(new, "Links", "Letterboxd.lnk"))
+        assert os.path.isfile(os.path.join(new, "Links", "TVTime.lnk"))
+
+
+# ---------- I2: rollback double-failure (the desync audit trail) ----------
+
+class TestRollbackDoubleFailure:
+    def test_double_failure_writes_fail_marker(self, tmp_path, monkeypatch):
+        marker = tmp_path / ".rollbacks.log"
+        monkeypatch.setattr(f, "_ROLLBACK_MARKER_PATH", str(marker))
+        monkeypatch.setattr(f, "DRY_RUN", False)
+        def _boom(*a, **k):
+            raise OSError("rename back failed")
+        monkeypatch.setattr(f.os, "rename", _boom)
+        assert f.rollback_rename(r"C:\new", r"C:\old") is False
+        assert marker.exists()
+        assert "FAIL" in marker.read_text(encoding="utf-8")
+
+    def test_dry_run_does_not_touch_disk(self, monkeypatch):
+        monkeypatch.setattr(f, "DRY_RUN", True)
+        called = {"n": 0}
+        monkeypatch.setattr(f.os, "rename", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+        assert f.rollback_rename(r"C:\new", r"C:\old") is True
+        assert called["n"] == 0
+
+
+# ---------- I2: _is_safe_url enforced end-to-end in the generated VBS ----------
+
+class TestSubtitleVbsInjectionGuard:
+    def test_malicious_provider_urls_replaced(self, tmp_path, monkeypatch):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        monkeypatch.setattr(f, "get_subdl_web_url",
+                            lambda *a, **k: 'https://evil/" & CreateObject("x")')
+        monkeypatch.setattr(f, "get_opensubtitles_web_url",
+                            lambda *a, **k: "https://evil/\ninjected")
+        f.create_shortcuts("radarr", str(folder), "tt0111161", "123", "Show",
+                           is_korean=False, is_anime=False, year="2010")
+        vbs = (folder / "Links" / "Subtitle.vbs").read_text(encoding="utf-8")
+        assert '& CreateObject("x")' not in vbs        # quote-breakout payload gone
+        assert "injected" not in vbs                   # newline-injection payload gone
+        assert "subdl.com/search/tt0111161" in vbs     # safe fallback substituted
+
+
+# ---------- I2: _fs_lock contention + the _process skip ----------
+
+class TestFsLock:
+    def test_second_acquire_blocked(self):
+        with f._fs_lock("af_test_key", retries=1, wait_s=0) as a:
+            assert a is True
+            with f._fs_lock("af_test_key", retries=1, wait_s=0) as b:
+                assert b is False
+
+    def test_stale_lock_reclaimed(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TEMP", str(tmp_path))
+        lockdir = tmp_path / "arr_finisher_lock_afstale"
+        lockdir.mkdir()
+        old = os.stat(str(lockdir)).st_mtime - (f._FS_LOCK_STALE_SECS + 100)
+        os.utime(str(lockdir), (old, old))
+        with f._fs_lock("afstale", retries=2, wait_s=0) as a:
+            assert a is True   # stale lock reclaimed
+
+    def test_process_skips_when_lock_held(self, staging, make_series,
+                                          patch_providers, monkeypatch, clear_env_vars):
+        folder = make_series("Locked (2024)")
+        patch_providers["imdb_rating"] = "8.0"
+        @contextmanager
+        def fake_lock(key, retries=6, wait_s=0.5):
+            yield False
+        monkeypatch.setattr(f, "_fs_lock", fake_lock)
+        renames = {"n": 0}
+        monkeypatch.setattr(f, "rename_folder",
+                            lambda *a, **k: renames.__setitem__("n", renames["n"] + 1) or a[0])
+        os.environ.update({
+            "Sonarr_Series_Id": "1", "Sonarr_Series_ImdbId": "tt1",
+            "Sonarr_Series_Title": "Locked (2024)", "Sonarr_OriginalLanguage": "English",
+        })
+        f.process_sonarr(folder)
+        assert renames["n"] == 0       # lock held → no work
+        assert os.path.isdir(folder)
+
+
+# ---------- I2: get_object_by_path real normalizer ----------
+
+class TestGetObjectByPath:
+    def test_matches_case_and_slash_insensitively(self, monkeypatch):
+        monkeypatch.setattr(f, "_library_cache", {"sonarr": [{"path": "D:/TV Shows/The Boys", "id": 7}]})
+        got = f.get_object_by_path("sonarr", r"D:\tv shows\THE BOYS")
+        assert got and got["id"] == 7
+
+    def test_trailing_slash_matches(self, monkeypatch):
+        monkeypatch.setattr(f, "_library_cache", {"sonarr": [{"path": r"D:\TV\Foo", "id": 1}]})
+        assert f.get_object_by_path("sonarr", "D:\\TV\\Foo\\")["id"] == 1
+
+    def test_near_miss_returns_none(self, monkeypatch):
+        monkeypatch.setattr(f, "_library_cache", {"sonarr": [{"path": r"D:\TV\The Boys", "id": 1}]})
+        assert f.get_object_by_path("sonarr", r"D:\TV\The Boys of Summer") is None
+
+
+# ---------- I2: _sweep_one restores env vars in its finally ----------
+
+class TestSweepOneEnvRestore:
+    def test_restores_preexisting_and_pops_new(self, staging, make_series,
+                                               patch_providers, monkeypatch, clear_env_vars):
+        folder = make_series("EnvTest (2020)")
+        patch_providers["imdb_rating"] = "7.0"
+        os.environ["Sonarr_Series_Title"] = "SENTINEL"     # pre-existing
+        os.environ.pop("Sonarr_Series_TvdbId", None)        # ensure absent
+        fake_obj = {"id": 5, "imdbId": "tt5", "tvdbId": 99, "title": "EnvTest",
+                    "year": 2020, "originalLanguage": {"name": "English"}, "seriesType": "standard"}
+        monkeypatch.setattr(f, "get_object_by_path", lambda svc, p: fake_obj)
+        f._sweep_one("sonarr", folder)
+        assert os.environ.get("Sonarr_Series_Title") == "SENTINEL"   # restored
+        assert "Sonarr_Series_TvdbId" not in os.environ             # popped
+
+
+# ---------- F1: --check-rollbacks scans .rollbacks.log ----------
+
+class TestCheckRollbacks:
+    def test_no_file_is_clean(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(f, "_ROLLBACK_MARKER_PATH", str(tmp_path / ".rollbacks.log"))
+        assert f.check_rollbacks() == 0
+
+    def test_fail_entries_flagged(self, monkeypatch, tmp_path):
+        p = tmp_path / ".rollbacks.log"
+        p.write_text("[2026-01-01 00:00:00] OK   a -> b (API refused rename)\n"
+                     "[2026-01-02 00:00:00] FAIL disk=x service_expects=y err=z\n",
+                     encoding="utf-8")
+        monkeypatch.setattr(f, "_ROLLBACK_MARKER_PATH", str(p))
+        assert f.check_rollbacks() == 1
+
+    def test_only_ok_entries_is_clean(self, monkeypatch, tmp_path):
+        p = tmp_path / ".rollbacks.log"
+        p.write_text("[2026-01-01 00:00:00] OK   a -> b (API refused rename)\n", encoding="utf-8")
+        monkeypatch.setattr(f, "_ROLLBACK_MARKER_PATH", str(p))
+        assert f.check_rollbacks() == 0
+
+
+# ---------- F2: ENABLE_HIDE_METADATA hides .nfo + artwork sidecars ----------
+
+class TestHideMetadata:
+    def test_hides_nfo_and_artwork_not_media(self, tmp_path, monkeypatch):
+        folder = tmp_path / "show"
+        folder.mkdir()
+        (folder / "movie.nfo").write_text("x")
+        (folder / "movie-fanart.jpg").write_bytes(b"x")
+        (folder / "S01E01.mkv").write_bytes(b"x")
+        hidden = []
+        def spy(path, add=0, remove=0):
+            if add & f._FILE_ATTRIBUTE_HIDDEN:
+                hidden.append(os.path.basename(str(path)))
+            return True
+        monkeypatch.setattr(f, "_set_file_attrs", spy)
+        f._hide_metadata_files(str(folder))
+        assert "movie.nfo" in hidden
+        assert "movie-fanart.jpg" in hidden
+        assert "S01E01.mkv" not in hidden
+
+
+# ---------- I2: validate_config distinguishes its two return codes ----------
+
+class TestValidateConfigReturnCode:
+    def _stub_healthy(self, monkeypatch):
+        for k in ("SONARR_API_KEY", "RADARR_API_KEY", "OMDB_API_KEY",
+                  "SUBDL_API_KEY", "OPENSUBTITLES_API_KEY"):
+            monkeypatch.setattr(f, k, "set")
+            monkeypatch.setenv(k, "set")
+        monkeypatch.setattr(f, "HAS_WIN32COM", True)
+        monkeypatch.setattr(f, "_pillow_available", lambda: True)
+        monkeypatch.setattr(f, "get_imdb_rating_from_graphql", lambda _id: "9.0")
+
+        class _R:
+            status_code = 200
+            def json(self_): return {"Response": "True"}
+            def raise_for_status(self_): pass
+        monkeypatch.setattr(f, "http",
+                            lambda: type("S", (), {"get": staticmethod(lambda *a, **k: _R())})())
+
+    def test_all_healthy_returns_zero(self, monkeypatch):
+        self._stub_healthy(monkeypatch)
+        assert f.validate_config() == 0
+
+    def test_missing_key_returns_one(self, monkeypatch):
+        self._stub_healthy(monkeypatch)
+        monkeypatch.setattr(f, "OMDB_API_KEY", "")
+        monkeypatch.delenv("OMDB_API_KEY", raising=False)
+        assert f.validate_config() == 1

@@ -33,7 +33,7 @@ Then in Sonarr/Radarr: **Settings → Connect → Custom Script**, point at
 | **Rating suffix in folder name** | `[IMDb 8.6]`, `[MDL 7.5]`, or `[MAL 9.3]` — picks the best source automatically (see below) |
 | **`Links/` subfolder with shortcuts** | IMDb, Parents Guide, TVTime, Letterboxd, MyDramaList, MyAnimeList, Twitter, combined Subtitle (SubDL + Subsource + OpenSubtitles) |
 | **Explorer tooltip** | OMDb plot summary + rating shown on hover, via `desktop.ini` `InfoTip` |
-| **Sonarr/Radarr path sync** | Folder rename is mirrored via API, with rollback on API failure. The rare double-failure case (rollback also fails) is appended to `.rollbacks.log` |
+| **Sonarr/Radarr path sync** | Folder rename is mirrored via API, with rollback on API failure. Every rollback is journaled to `.rollbacks.log` (`OK` when the disk was restored; `FAIL` for the rare double-failure where disk and service are left out of sync). Run `--check-rollbacks` to surface any `FAIL` entries |
 
 ### Rating source auto-detection
 
@@ -204,8 +204,9 @@ python arr_finisher.py --refresh tt7160070        :: invalidate one IMDb ID
 
 **Rollbacks.** When Sonarr/Radarr refuses a path change after the disk has
 already been renamed, the script renames the folder back and records the event
-in `.rollbacks.log` next to the script. Check that file periodically for any
-`FAIL` entries (disk and service out of sync — rare, needs manual fixup).
+in `.rollbacks.log` next to the script. Run `python arr_finisher.py
+--check-rollbacks` (it exits non-zero and lists any `FAIL` entries — disk and
+service out of sync, rare, needs manual fixup).
 
 ### Manual / one-off commands
 
@@ -219,6 +220,7 @@ python arr_finisher.py --service sonarr --path "D:\TV Shows\Foo"   # single fold
 python arr_finisher.py --service radarr --path "E:\Movies\Foo" --force   # also rewrite icon/shortcuts/tooltip even if up to date
 python arr_finisher.py --clear-cache                               # wipe .rating_cache.json
 python arr_finisher.py --refresh tt7160070                         # invalidate one IMDb ID so next sweep re-fetches
+python arr_finisher.py --check-rollbacks                           # report unresolved FAIL entries in .rollbacks.log (exit 1 if any)
 python arr_finisher.py --version                                   # print version and exit
 python arr_finisher.py --verbose                                   # include DEBUG-level logs in this run
 ```
@@ -226,7 +228,7 @@ python arr_finisher.py --verbose                                   # include DEB
 `--validate` output looks like this when everything is healthy:
 
 ```
-=== arr_finisher --validate ===
+=== arr_finisher 1.0.0 --validate ===
 
   [OK ] env  SONARR_API_KEY is set
   [OK ] env  RADARR_API_KEY is set
@@ -235,16 +237,17 @@ python arr_finisher.py --verbose                                   # include DEB
   [OK ] env  OPENSUBTITLES_API_KEY is set
   [OK ] module  pywin32 available
   [OK ] module  Pillow available (11.3.0)
-  [OK ] icons  all 10 icon files present
+  [OK ] icons  all 8 icon files present
   [OK ] http  Sonarr reachable (200)
   [OK ] http  Radarr reachable (200)
+  [OK ] http  IMDb GraphQL reachable
   [OK ] http  OMDb reachable (200)
   [OK ] http  Kuryana reachable (200)
   [OK ] http  Jikan reachable (200)
   [OK ] http  SubDL reachable (200)
   [OK ] http  OpenSubtitles reachable (200)
 
-15 passed, 0 failed
+16 passed, 0 failed
 ```
 
 ### Sweep roots
@@ -279,7 +282,9 @@ the script regenerates them as needed.
 
 At the top of `arr_finisher.py` — every behavior is independently switchable
 (rename, icon, shortcuts, tooltip, MDL/MAL, subtitle combo, etc.). Defaults are
-sensible; flip what you don't want.
+sensible; flip what you don't want. `ENABLE_HIDE_METADATA` (default off) also
+hides `.nfo` + extra-artwork sidecars in each folder, restoring the cleaner
+Explorer view the old Creator.exe `-h` produced.
 
 ## Tests
 
